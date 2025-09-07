@@ -242,6 +242,10 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		
 		sh '''#!/bin/bash
 		set -euo pipefail
+		pwd
+        ls -la
+        # 看看是否真的有 *.xcodeproj 目录
+        ls -ld *.xcodeproj || echo "No .xcodeproj dir at this level"
 		# 在当前工作区自动找 .xcworkspace 或 .xcodeproj
 		if compgen -G "*.xcworkspace" >/dev/null; then
 		  Project_Name=$(ls *.xcworkspace | head -1 | sed 's/\\.xcworkspace$//')
