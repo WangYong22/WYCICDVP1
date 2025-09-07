@@ -242,21 +242,52 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		
 		sh '''#!/bin/bash
 		set -euo pipefail
-		pwd
-        ls -la
-        # 看看是否真的有 *.xcodeproj 目录
-        ls -ld *.xcodeproj || echo "No .xcodeproj dir at this level"
-		# 在当前工作区自动找 .xcworkspace 或 .xcodeproj
-		if compgen -G "*.xcworkspace" >/dev/null; then
-		  Project_Name=$(ls *.xcworkspace | head -1 | sed 's/\\.xcworkspace$//')
-		elif compgen -G "*.xcodeproj" >/dev/null; then
-		  Project_Name=$(ls *.xcodeproj | head -1 | sed 's/\\.xcodeproj$//')
+		
+		echo "[PWD] $(pwd)"
+		echo "[LS]"
+		ls -la || true
+		
+		# 在当前目录优先找 .xcworkspace；没有就找 .xcodeproj（仅在当前目录，必要时再扩到下一层）
+		Project_Path=""
+		if found=$(find . -maxdepth 1 -type d -name "*.xcworkspace" -print -quit 2>/dev/null); then
+		  Project_Path="$found"
+		elif found=$(find . -maxdepth 1 -type d -name "*.xcodeproj" -print -quit 2>/dev/null); then
+		  Project_Path="$found"
 		else
-		  echo "[ERR] 未找到 .xcworkspace 或 .xcodeproj"
+		  # 往下一层再找一次，防止工程放在子目录（如 ios/）
+		  if found=$(find . -maxdepth 2 -type d \\( -name "*.xcworkspace" -o -name "*.xcodeproj" \\) -print -quit 2>/dev/null); then
+			Project_Path="$found"
+		  fi
+		fi
+		
+		if [[ -z "${Project_Path}" ]]; then
+		  echo "[ERR] 未找到 .xcworkspace 或 .xcodeproj 目录；请确认工程在当前工作区内。"
 		  exit 1
 		fi
 		
-		echo "[INFO] Project_Name=$Project_Name"
+		# 取纯名与类型
+		base="${Project_Path##*/}"   # 去掉前缀路径
+		Project_Kind="${base##*.}"   # xcworkspace / xcodeproj
+		Project_Name="${base%.*}"    # 去掉后缀
+		
+		echo "[INFO] Found path    : ${Project_Path}"
+		echo "[INFO] Project_Kind  : ${Project_Kind}"
+		echo "[INFO] Project_Name  : ${Project_Name}"
+		
+		# 写到文件供后续步骤使用
+		{
+		  echo "Project_Path=${Project_Path}"
+		  echo "Project_Kind=${Project_Kind}"
+		  echo "Project_Name=${Project_Name}"
+		} > .xproj.detected
+		
+		# （可选）列一下 schemes / configurations 方便确认
+		if [[ "${Project_Kind}" == "xcworkspace" ]]; then
+		  xcodebuild -list -workspace "${Project_Path}" || true
+		else
+		  xcodebuild -list -project "${Project_Path}" || true
+		fi
+		
 
 			
 			
