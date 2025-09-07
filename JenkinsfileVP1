@@ -289,33 +289,80 @@ pipeline {
 			PREFER_BUNDLEID="${PREFER_BUNDLEID:-}"     # 若想优先选择某个 BundleID 的 profile，可设置它；留空则按修改时间最新
 			# ============================================================
 			
-			echo "[SCAN] root=$SEARCH_ROOT  glob=($PROFILE_GLOB)"
+			cat > _pick_profile.sh <<'BASH'
+			set -euo pipefail
 			
-			#  找 profile（优先匹配指定 BundleID；否则按修改时间最新）
-			mapfile -t CANDIDATES < <(cd "$SEARCH_ROOT" && ls -1t ${PROFILE_GLOB} 2>/dev/null || true)
-			if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
+			SEARCH_ROOT="${SEARCH_ROOT:-$PWD}"
+			PROFILE_GLOB=${PROFILE_GLOB:-"*.mobileprovision *.provisionprofile"}
+			PREFER_BUNDLEID="${PREFER_BUNDLEID:-}"
+			
+			# 收集候选（按时间倒序），兼容 bash 3.2
+			CANDIDATES=()
+			# shellcheck disable=SC2086
+			while IFS= read -r f; do
+			  [ -n "$f" ] && CANDIDATES+=("$f")
+			done < <(cd "$SEARCH_ROOT" && ls -1t ${PROFILE_GLOB} 2>/dev/null || true)
+			
+			if [ ${#CANDIDATES[@]} -eq 0 ]; then
 			  echo "[ERR] 没找到 *.mobileprovision / *.provisionprofile；请把 profile 放到仓库里或设置 PROFILE_GLOB"
 			  exit 1
 			fi
 			
+			# 读取 APPID（TEAMID.bundleid），兼容纯 XML 情况
+			read_appid() {
+			  local pf="$1" tmp err
+			  tmp="$(mktemp /tmp/_pp.XXXXXX.plist)"
+			  err="$(mktemp /tmp/_pp.err.XXXXXX)"
+			  if /usr/bin/security cms -D -i "$pf" >"$tmp" 2>"$err"; then
+				: # ok
+			  else
+				if file "$pf" | grep -qi 'XML'; then
+				  cp "$pf" "$tmp"
+				else
+				  rm -f "$tmp" "$err"
+				  return 1
+				fi
+			  fi
+			  APPID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$tmp" 2>/dev/null || echo "")
+			  rm -f "$tmp" "$err"
+			  [ -n "$APPID" ]
+			}
+			
 			pick_profile() {
-			  local f
-			  if [[ -n "$PREFER_BUNDLEID" ]]; then
+			  local f pf
+			
+			  # 有 PREFER_BUNDLEID 时，先精确匹配（用 shell 通配判断，避免正则转义问题）
+			  if [ -n "$PREFER_BUNDLEID" ]; then
 				for f in "${CANDIDATES[@]}"; do
-				  if /usr/bin/security cms -D -i "$SEARCH_ROOT/$f" \
-					   | /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' /dev/stdin \
-					   | grep -q "\.${PREFER_BUNDLEID}$"; then
-					echo "$SEARCH_ROOT/$f"
-					return 0
+				  pf="$SEARCH_ROOT/$f"
+				  if read_appid "$pf"; then
+					# APPID 形如 TEAMID.com.xxx.yyy
+					local bid="${APPID#*.}"
+					if [ "$bid" = "$PREFER_BUNDLEID" ]; then
+					  printf '%s\n' "$pf"
+					  return 0
+					fi
 				  fi
 				done
 			  fi
-			  # 默认：按时间最新
-			  echo "$SEARCH_ROOT/${CANDIDATES[0]}"
+			
+			  # 否则按时间最新
+			  printf '%s\n' "$SEARCH_ROOT/${CANDIDATES[0]}"
+			  return 0
 			}
 			
 			PROFILE="$(pick_profile)"
 			echo "[PICK] $PROFILE"
+			# 回传路径给外层
+			printf '%s' "$PROFILE" > _picked_profile.path
+			BASH
+			
+			# 执行子脚本
+			SEARCH_ROOT="$SEARCH_ROOT" PROFILE_GLOB="$PROFILE_GLOB" PREFER_BUNDLEID="$PREFER_BUNDLEID" bash _pick_profile.sh
+			
+			PROFILE="$(cat _picked_profile.path)"
+			echo "[PICK] $PROFILE"
+			'''
 			
 			#  解包为 plist
 			PLIST="$(mktemp /tmp/_pp.XXXXXX.plist)"
