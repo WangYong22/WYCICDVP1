@@ -242,33 +242,44 @@ pipeline {
 		
 		sh '''#!/bin/bash
 		set -euo pipefail
-			# 在当前工作区自动找 .xcworkspace 或 .xcodeproj
-				if [ -f *.xcworkspace ]; then
-				  Project_Name=$(ls *.xcworkspace | head -1 | sed 's/\.xcworkspace$//')
-				elif [ -f *.xcodeproj ]; then
-				  Project_Name=$(ls *.xcodeproj | head -1 | sed 's/\.xcodeproj$//')
-				else
-				  echo "[ERR] 未找到 .xcworkspace 或 .xcodeproj"
-				  exit 1
-				fi
-			echo "[INFO] Project_Name=$Project_Name"
-			
-			
-		# 在当前工作区自动找	project_scheme
-		if [ -f "${Project_Name}.xcworkspace" ]; then
-		  project_scheme=$(xcodebuild -list -workspace "${Project_Name}.xcworkspace" \
-			| awk '/Schemes:/{flag=1;next}/^$/{flag=0}flag' | head -1 | xargs)
+		# 在当前工作区自动找 .xcworkspace 或 .xcodeproj
+		if compgen -G "*.xcworkspace" >/dev/null; then
+		  Project_Name=$(ls *.xcworkspace | head -1 | sed 's/\\.xcworkspace$//')
+		elif compgen -G "*.xcodeproj" >/dev/null; then
+		  Project_Name=$(ls *.xcodeproj | head -1 | sed 's/\\.xcodeproj$//')
 		else
+		  echo "[ERR] 未找到 .xcworkspace 或 .xcodeproj"
+		  exit 1
+		fi
+		
+		echo "[INFO] Project_Name=$Project_Name"
+
+			
+			
+		# 检测 workspace 或 project
+		if [ -d "${Project_Name}.xcworkspace" ]; then
+		  echo "[INFO] Detected workspace: ${Project_Name}.xcworkspace"
+		  project_scheme=$(xcodebuild -list -workspace "${Project_Name}.xcworkspace" \
+			| awk '/Schemes:/{flag=1;next}/^$/{flag=0}flag' \
+			| head -1 | xargs)
+		else
+		  echo "[INFO] Detected project: ${Project_Name}.xcodeproj"
 		  project_scheme=$(xcodebuild -list -project "${Project_Name}.xcodeproj" \
-			| awk '/Schemes:/{flag=1;next}/^$/{flag=0}flag' | head -1 | xargs)
-		fi		
+			| awk '/Schemes:/{flag=1;next}/^$/{flag=0}flag' \
+			| head -1 | xargs)
+		fi
 		echo "[INFO] project_scheme=$project_scheme"
 		
-		
-		# 在当前工作区自动找Build Configuration
-		Configuration=$(xcodebuild -list -project "${Project_Name}.xcodeproj" \
-		  | awk '/Build Configurations:/{flag=1;next}/If no build configuration/{flag=0}flag' \
-		  | head -1 | xargs)
+		# 自动获取第一个 Build Configuration
+		if [ -d "${Project_Name}.xcworkspace" ]; then
+		  Configuration=$(xcodebuild -list -workspace "${Project_Name}.xcworkspace" \
+			| awk '/Build Configurations:/{flag=1;next}/If no build configuration/{flag=0}flag' \
+			| head -1 | xargs)
+		else
+		  Configuration=$(xcodebuild -list -project "${Project_Name}.xcodeproj" \
+			| awk '/Build Configurations:/{flag=1;next}/If no build configuration/{flag=0}flag' \
+			| head -1 | xargs)
+		fi
 		echo "[INFO] Configuration=$Configuration"
 			
 			
