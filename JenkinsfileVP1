@@ -370,22 +370,63 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		echo "[INSTALL] $DEST_DIR/${UUID}.mobileprovision"
 		
 		# 选择匹配证书（需要你已导入带私钥证书并解锁 login 钥匙串）
-		echo "[CHK] E: pick signing identity"
+		echo "[CHK] E: pick signing identity by fingerprint (robust way)"
 
-		CODE_SIGN_IDENTITY=$(
-		  security find-identity -v -p codesigning | awk -v k="$CERT_KIND" -v t="$TEAMID" '
-			index($0,k) && index($0,"(" t ")") {
-			  if (match($0, /"[^"]+"/)) {
-				print substr($0, RSTART+1, RLENGTH-2); exit
-			  }
-			}'
-		)
-		echo "[CERT] $CODE_SIGN_IDENTITY"
+		# 1) 从 profile 里取出所有允许的 DeveloperCertificates，算出它们的 SHA1 指纹
+		ALLOWED_FPS=()
+		idx=0
+		while : ; do
+		  # 取第 idx 个证书的 DER（base64）
+		  DER_B64=$(/usr/libexec/PlistBuddy -c "Print :DeveloperCertificates:$idx" "$PLIST" 2>/dev/null || true)
+		  [ -z "$DER_B64" ] && break
+		  # 去掉 PlistBuddy 打印时可能带的多余行头（它通常直接输出 raw base64）
+		  echo "$DER_B64" | base64 -D > /tmp/_pp_cert_$idx.der
+		  FP=$(openssl x509 -inform DER -in /tmp/_pp_cert_$idx.der -noout -fingerprint -sha1 2>/dev/null | sed 's/^.*=//;s/://g' | tr '[:lower:]' '[:upper:]')
+		  if [ -n "$FP" ]; then
+			ALLOWED_FPS+=("$FP")
+		  fi
+		  idx=$((idx+1))
+		done
+		
+		if [ ${#ALLOWED_FPS[@]} -eq 0 ]; then
+		  echo "[ERR] 这个 provisioning profile 里没有 DeveloperCertificates 列表，无法匹配证书。"
+		  exit 1
+		fi
+		echo "[DBG] allowed fingerprints from profile:"
+		printf '  - %s\n' "${ALLOWED_FPS[@]}"
+		
+		# 2) 列出钥匙串里当前可用的签名身份（security find-identity 的头部十六进制就是 SHA1）
+		#    同时优先按证书类型（Apple Development / Apple Distribution）过滤
+		MATCH_ID=""
+		security find-identity -v -p codesigning | while read -r line; do
+		  # 形如：  1) 82230FD2... "Apple Development: Yong Wang (LFBT5QQQ6J)"
+		  HEX=$(echo "$line" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
+		  NAME=$(echo "$line" | sed -n 's/.*"\(.*\)".*/\1/p')
+		  # 先看类型是否匹配（CERT_KIND=Apple Development 或 Apple Distribution）
+		  echo "$NAME" | grep -Fq "$CERT_KIND" || continue
+		  # 指纹匹配（允许去掉冒号/大小写差异）
+		  for fp in "${ALLOWED_FPS[@]}"; do
+			if [ "$HEX" = "$fp" ]; then
+			  echo "[HIT] $HEX  =>  $NAME"
+			  echo "$NAME"
+			  break
+			fi
+		  done
+		done > /tmp/_picked_identity.txt
+		
+		if [ -s /tmp/_picked_identity.txt ]; then
+		  CODE_SIGN_IDENTITY=$(head -1 /tmp/_picked_identity.txt)
+		else
+		  CODE_SIGN_IDENTITY=""
+		fi
+		
 		if [ -z "${CODE_SIGN_IDENTITY:-}" ]; then
-		  echo "[ERR] 找不到匹配证书（$CERT_KIND, Team=$TEAMID）。"
+		  echo "[ERR] 没有在钥匙串中找到与该 profile 允许的证书指纹匹配、且类型为『$CERT_KIND』的签名身份。"
+		  echo "===(debug: your local identities)==="
 		  security find-identity -v -p codesigning || true
 		  exit 1
 		fi
+		
 		echo "[CERT] $CODE_SIGN_IDENTITY"
 		
 		# —— 这些变量若未定义，这里统一给兜底，避免 set -u 触发 ——
