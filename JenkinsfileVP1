@@ -457,34 +457,54 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		echo "[INFO] Project_Name=$Project_Name"
 		
 		# 2) 解析 schemes（排除 *Tests，优先与工程同名）
+		echo "[DBG] Step A: list schemes from $Project_Kind"
+
 		if [[ "$Project_Kind" == "xcworkspace" ]]; then
-		  SCHEMES=$(xcodebuild -list -workspace "$Project_Path" 2>/dev/null | awk '
-			$0 ~ /^Schemes:/ {inlist=1; next}
-			inlist && NF==0   {inlist=0}
-			inlist {print}')
+		  SCHEMES=$(xcodebuild -list -workspace "$Project_Path" 2>&1)
 		else
-		  SCHEMES=$(xcodebuild -list -project   "$Project_Path" 2>/dev/null | awk '
-			$0 ~ /^Schemes:/ {inlist=1; next}
-			inlist && NF==0   {inlist=0}
-			inlist {print}')
+		  SCHEMES=$(xcodebuild -list -project "$Project_Path" 2>&1)
 		fi
 		
-		# 去掉空白，形成数组
+		echo "[DBG] Step B: raw xcodebuild -list output >>>"
+		echo "$SCHEMES" | sed -e 's/^/  | /'
+		echo "[DBG] <<< raw output end"
+		
+		# 从输出里提取 schemes 部分
+		PARSED=$(printf '%s\n' "$SCHEMES" | awk '
+		  $0 ~ /^Schemes:/ {inlist=1; next}
+		  inlist && NF==0   {inlist=0}
+		  inlist {print}')
+		
+		echo "[DBG] Step C: parsed schemes candidates (before filter):"
+		printf '  - %s\n' $PARSED
+		
+		# 去掉 *Tests
 		SCHEME_CAND=()
 		while IFS= read -r s; do
 		  s="$(echo "$s" | xargs)"
 		  [ -n "$s" ] && SCHEME_CAND+=("$s")
-		done < <(printf '%s\n' "$SCHEMES" | grep -v 'Tests$' || true)
+		done < <(printf '%s\n' "$PARSED" | grep -v 'Tests$' || true)
 		
-		# 如果全部都是 *Tests，就退回全量列表
+		echo "[DBG] Step D: after removing *Tests"
+		printf '  - %s\n' "${SCHEME_CAND[@]:-<none>}"
+		
+		# 如果全部都是 *Tests，就退回原始
 		if [ ${#SCHEME_CAND[@]} -eq 0 ]; then
+		  echo "[WARN] Step E: no schemes survived filtering, fallback to raw list"
 		  while IFS= read -r s; do
 			s="$(echo "$s" | xargs)"
 			[ -n "$s" ] && SCHEME_CAND+=("$s")
-		  done < <(printf '%s\n' "$SCHEMES")
+		  done < <(printf '%s\n' "$PARSED")
 		fi
 		
-		[ ${#SCHEME_CAND[@]} -gt 0 ] || { echo "[ERR] 未找到任何 Scheme"; exit 1; }
+		echo "[DBG] Step F: final scheme candidates:"
+		printf '  - %s\n' "${SCHEME_CAND[@]:-<none>}"
+		
+		# 最终检查
+		if [ ${#SCHEME_CAND[@]} -eq 0 ]; then
+		  echo "[ERR] 未找到任何 Scheme"
+		  exit 1
+		fi
 		
 		# 选择：优先与工程同名，否则第一个
 		auto_scheme="${SCHEME_CAND[0]}"
