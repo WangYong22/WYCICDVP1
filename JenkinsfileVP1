@@ -362,7 +362,7 @@ pipeline {
 			
 			PROFILE="$(cat _picked_profile.path)"
 			echo "[PICK] $PROFILE"
-			'''
+			
 			
 			#  解包为 plist
 			PLIST="$(mktemp /tmp/_pp.XXXXXX.plist)"
