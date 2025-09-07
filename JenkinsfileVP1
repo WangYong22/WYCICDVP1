@@ -36,100 +36,100 @@ pipeline {
 </slave>
 """.stripIndent()
 
-            // 2) 取 crumb -> /scriptText 创建/更新 -> 覆盖 config.xml -> 解析 JNLP secret（不跑 kubectl）
-            sh """#!/bin/bash
-set -xeuo pipefail
-NODE='${NODE}'
-JURL='${JURL}'
+     // 2) 取 crumb -> /scriptText 创建/更新 -> 覆盖 config.xml -> 解析 JNLP secret（不跑 kubectl）
+     sh """#!/bin/bash
+		set -xeuo pipefail
+		NODE='${NODE}'
+		JURL='${JURL}'
 
-# 取 CSRF crumb
-if command -v jq >/dev/null 2>&1; then
-  CRUMB=\$(curl -fsS -u "\$JAUTH" "\$JURL/crumbIssuer/api/json" | jq -r .crumb)
-else
-  CRUMB=\$(curl -fsS -u "\$JAUTH" "\$JURL/crumbIssuer/api/json" | sed -n 's/.*"crumb"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
-fi
-[ -n "\$CRUMB" ] || { echo "Failed to get CRUMB"; exit 1; }
+		# 取 CSRF crumb
+		if command -v jq >/dev/null 2>&1; then
+		  CRUMB=\$(curl -fsS -u "\$JAUTH" "\$JURL/crumbIssuer/api/json" | jq -r .crumb)
+		else
+		  CRUMB=\$(curl -fsS -u "\$JAUTH" "\$JURL/crumbIssuer/api/json" | sed -n 's/.*"crumb"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
+		fi
+		[ -n "\$CRUMB" ] || { echo "Failed to get CRUMB"; exit 1; }
 
-# 写到临时文件，避免 read -d '' 的坑
-cat > .scriptText.groovy <<GROOVY
-import jenkins.model.Jenkins
-import hudson.model.Node
-import hudson.slaves.DumbSlave
-import hudson.slaves.RetentionStrategy
-import hudson.slaves.JNLPLauncher
-import java.util.LinkedList
+		# 写到临时文件，避免 read -d '' 的坑
+		cat > .scriptText.groovy <<GROOVY
+		import jenkins.model.Jenkins
+		import hudson.model.Node
+		import hudson.slaves.DumbSlave
+		import hudson.slaves.RetentionStrategy
+		import hudson.slaves.JNLPLauncher
+		import java.util.LinkedList
 
-def name   = "${NODE}"            // ← 直接嵌入 bash 里的 NODE 值
-def labels = name
-def home   = "/Users/test/jenkins-agent"
+		def name   = "${NODE}"            // ← 直接嵌入 bash 里的 NODE 值
+		def labels = name
+		def home   = "/Users/test/jenkins-agent"
+		
+		def j = Jenkins.get()
+		def n = j.getNode(name)
+		def launcher = new JNLPLauncher()
+		launcher.setWebSocket(true)
 
-def j = Jenkins.get()
-def n = j.getNode(name)
-def launcher = new JNLPLauncher()
-launcher.setWebSocket(true)
+		if (n == null) {
+		  n = new DumbSlave(name, "ephemeral macOS", home, "1",
+			Node.Mode.NORMAL, labels, launcher,
+			new RetentionStrategy.Always(), new LinkedList())
+		  j.addNode(n)
+		} else {
+		  n.setLauncher(launcher)
+		  n.setLabelString(labels)
+		  n.setNumExecutors(1)
+		  n.setMode(Node.Mode.NORMAL)
+		  j.save()
+		}
+		println "READY"
+		GROOVY
 
-if (n == null) {
-  n = new DumbSlave(name, "ephemeral macOS", home, "1",
-    Node.Mode.NORMAL, labels, launcher,
-    new RetentionStrategy.Always(), new LinkedList())
-  j.addNode(n)
-} else {
-  n.setLauncher(launcher)
-  n.setLabelString(labels)
-  n.setNumExecutors(1)
-  n.setMode(Node.Mode.NORMAL)
-  j.save()
-}
-println "READY"
-GROOVY
+		export NODE_NAME="\$NODE"
+		
+		# 执行 /scriptText
+		RESP=\$(curl -fsS -u "\$JAUTH" -H "Jenkins-Crumb: \$CRUMB" \\
+		  --data-urlencode script@.scriptText.groovy \\
+		  "\$JURL/scriptText")
+		echo "\$RESP" | grep -q READY || { echo "scriptText create node failed"; echo "\$RESP" | head -200; exit 1; }
+		
+		# 覆盖节点 config.xml（幂等）
+		curl -fsS -u "\$JAUTH" -H "Jenkins-Crumb: \$CRUMB" \\
+			 -X POST -H 'Content-Type: application/xml' \\
+			 --data-binary @node.xml \\
+			 "\$JURL/computer/\$NODE/config.xml"
 
-export NODE_NAME="\$NODE"
+		# 解析 JNLP secret（新旧路径兼容）
+		sleep 2
+		HTTP1=\$(curl -u "\$JAUTH" -w '%{http_code}' -fsSLo .jnlp1 "\$JURL/computer/\$NODE/jenkins-agent.jnlp" || true)
+		HTTP2=\$(curl -u "\$JAUTH" -w '%{http_code}' -fsSLo .jnlp2 "\$JURL/computer/\$NODE/slave-agent.jnlp"   || true)
+		echo "jenkins-agent.jnlp http=\$HTTP1, slave-agent.jnlp http=\$HTTP2"
+		
+		SECRET=""
+		SECRET=\$(grep -hoE -- '--secret [0-9a-f]{64,}' .jnlp1 .jnlp2 2>/dev/null | head -1 | awk '{print \$2}') || true
+		if [ -z "\$SECRET" ]; then
+		  SECRET=\$(grep -hoE -- '<argument>[0-9a-f]{64,}</argument>' .jnlp1 .jnlp2 2>/dev/null | head -1 | sed -E 's#</?argument>##g') || true
+		fi
+		[ -n "\$SECRET" ] || { echo "no JNLP secret parsed"; head -50 .jnlp1 .jnlp2 2>/dev/null || true; exit 1; }
+		echo "\$SECRET" > .jnlp.secret
+		echo "Parsed JNLP secret length=\${#SECRET}"
+		"""
 
-# 执行 /scriptText
-RESP=\$(curl -fsS -u "\$JAUTH" -H "Jenkins-Crumb: \$CRUMB" \\
-  --data-urlencode script@.scriptText.groovy \\
-  "\$JURL/scriptText")
-echo "\$RESP" | grep -q READY || { echo "scriptText create node failed"; echo "\$RESP" | head -200; exit 1; }
-
-# 覆盖节点 config.xml（幂等）
-curl -fsS -u "\$JAUTH" -H "Jenkins-Crumb: \$CRUMB" \\
-     -X POST -H 'Content-Type: application/xml' \\
-     --data-binary @node.xml \\
-     "\$JURL/computer/\$NODE/config.xml"
-
-# 解析 JNLP secret（新旧路径兼容）
-sleep 2
-HTTP1=\$(curl -u "\$JAUTH" -w '%{http_code}' -fsSLo .jnlp1 "\$JURL/computer/\$NODE/jenkins-agent.jnlp" || true)
-HTTP2=\$(curl -u "\$JAUTH" -w '%{http_code}' -fsSLo .jnlp2 "\$JURL/computer/\$NODE/slave-agent.jnlp"   || true)
-echo "jenkins-agent.jnlp http=\$HTTP1, slave-agent.jnlp http=\$HTTP2"
-
-SECRET=""
-SECRET=\$(grep -hoE -- '--secret [0-9a-f]{64,}' .jnlp1 .jnlp2 2>/dev/null | head -1 | awk '{print \$2}') || true
-if [ -z "\$SECRET" ]; then
-  SECRET=\$(grep -hoE -- '<argument>[0-9a-f]{64,}</argument>' .jnlp1 .jnlp2 2>/dev/null | head -1 | sed -E 's#</?argument>##g') || true
-fi
-[ -n "\$SECRET" ] || { echo "no JNLP secret parsed"; head -50 .jnlp1 .jnlp2 2>/dev/null || true; exit 1; }
-echo "\$SECRET" > .jnlp.secret
-echo "Parsed JNLP secret length=\${#SECRET}"
-"""
-
-// 关键：从文件读回到 Groovy 变量
-def SECRET = readFile('.jnlp.secret').trim()
-echo "Groovy got SECRET length=${SECRET.length()}"
-
-
-// 3) 现在进入 withKubeConfig，下发 K8s Secret 时，使用 Groovy 变量插值
-withKubeConfig([credentialsId: env.KCFG_ID]) {
-  sh """#!/bin/bash
-set -xeuo pipefail
-kubectl -n ci delete secret jenkins-macos-${NODE} --ignore-not-found || true
-kubectl -n ci create secret generic jenkins-macos-${NODE} \\
-  --from-literal=JENKINS_URL=${JURL} \
-  --from-literal=JENKINS_NODE_NAME=${NODE} \
-  --from-literal=JENKINS_SECRET=${SECRET}  \
-  --from-literal=VM_USER=test \
-  --from-literal=VM_PASS=test 
-"""
+		// 关键：从文件读回到 Groovy 变量
+		def SECRET = readFile('.jnlp.secret').trim()
+		echo "Groovy got SECRET length=${SECRET.length()}"
+		
+		
+		// 3) 现在进入 withKubeConfig，下发 K8s Secret 时，使用 Groovy 变量插值
+		withKubeConfig([credentialsId: env.KCFG_ID]) {
+		  sh """#!/bin/bash
+		set -xeuo pipefail
+		kubectl -n ci delete secret jenkins-macos-${NODE} --ignore-not-found || true
+		kubectl -n ci create secret generic jenkins-macos-${NODE} \\
+		  --from-literal=JENKINS_URL=${JURL} \
+		  --from-literal=JENKINS_NODE_NAME=${NODE} \
+		  --from-literal=JENKINS_SECRET=${SECRET}  \
+		  --from-literal=VM_USER=test \
+		  --from-literal=VM_PASS=test 
+		"""
             }
           }
         }
@@ -239,64 +239,157 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		'''
 	
 		// 2) 拉取 provisioning profile（用 Jenkins 中 ID=137ssh 的私钥）
-		withCredentials([sshUserPrivateKey(credentialsId: '137ssh',
-										   keyFileVariable: 'SSH_KEY',
-										   usernameVariable: 'SSH_USER')]) {
-		  sh '''#!/bin/bash
-			set -euo pipefail
-			REMOTE="17.87.2.137"
-			REMOTE_FILE="/Users/mdsadmin/WangYongiOS1.mobileprovision"     # <— 确认远端真实文件名
-			LOCAL="/tmp/WangYongiOS1.mobileprovision"
+		
+		#!/bin/bash
+		set -euo pipefail
+			# 在当前工作区自动找 .xcworkspace 或 .xcodeproj
+				if [ -f *.xcworkspace ]; then
+				  Project_Name=$(ls *.xcworkspace | head -1 | sed 's/\.xcworkspace$//')
+				elif [ -f *.xcodeproj ]; then
+				  Project_Name=$(ls *.xcodeproj | head -1 | sed 's/\.xcodeproj$//')
+				else
+				  echo "[ERR] 未找到 .xcworkspace 或 .xcodeproj"
+				  exit 1
+				fi
+			echo "[INFO] Project_Name=$Project_Name"
 			
-			echo "[SCP] $REMOTE:$REMOTE_FILE -> $LOCAL"
-			scp -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
-				"$SSH_USER@$REMOTE:$REMOTE_FILE" "$LOCAL"
-			'''
-		  }
-	
-		// 3) 安装 profile（解析 UUID）
-		sh '''#!/bin/bash
-			set -euo pipefail
-			PROFILE="/tmp/WangYongiOS1.mobileprovision"
-			PLIST="/tmp/WangYongiOS1.plist"
-			SECERR="/tmp/security.err"
 			
-			echo "==[PARSE] security cms -> $PLIST =="
-			# 先尝试按 CMS 解包；失败时把错误打出来，并在是 XML 的情况下兜底
+		# 在当前工作区自动找	project_scheme
+		if [ -f "${Project_Name}.xcworkspace" ]; then
+		  project_scheme=$(xcodebuild -list -workspace "${Project_Name}.xcworkspace" \
+			| awk '/Schemes:/{flag=1;next}/^$/{flag=0}flag' | head -1 | xargs)
+		else
+		  project_scheme=$(xcodebuild -list -project "${Project_Name}.xcodeproj" \
+			| awk '/Schemes:/{flag=1;next}/^$/{flag=0}flag' | head -1 | xargs)
+		fi		
+		echo "[INFO] project_scheme=$project_scheme"
+		
+		
+		# 在当前工作区自动找Build Configuration
+		Configuration=$(xcodebuild -list -project "${Project_Name}.xcodeproj" \
+		  | awk '/Build Configurations:/{flag=1;next}/If no build configuration/{flag=0}flag' \
+		  | head -1 | xargs)
+		echo "[INFO] Configuration=$Configuration"
+			
+			
+			# ========== 可配置项（也可在 Jenkins 环境变量里覆盖） ==========
+			SEARCH_ROOT="${WORKSPACE:-$PWD}"           # 在哪个目录查找（默认工作区）
+			PROFILE_GLOB="${PROFILE_GLOB:-*.mobileprovision *.provisionprofile}"  # 查找模式
+			PREFER_BUNDLEID="${PREFER_BUNDLEID:-}"     # 若想优先选择某个 BundleID 的 profile，可设置它；留空则按修改时间最新
+			# ============================================================
+			
+			echo "[SCAN] root=$SEARCH_ROOT  glob=($PROFILE_GLOB)"
+			
+			#  找 profile（优先匹配指定 BundleID；否则按修改时间最新）
+			mapfile -t CANDIDATES < <(cd "$SEARCH_ROOT" && ls -1t ${PROFILE_GLOB} 2>/dev/null || true)
+			if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
+			  echo "[ERR] 没找到 *.mobileprovision / *.provisionprofile；请把 profile 放到仓库里或设置 PROFILE_GLOB"
+			  exit 1
+			fi
+			
+			pick_profile() {
+			  local f
+			  if [[ -n "$PREFER_BUNDLEID" ]]; then
+				for f in "${CANDIDATES[@]}"; do
+				  if /usr/bin/security cms -D -i "$SEARCH_ROOT/$f" \
+					   | /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' /dev/stdin \
+					   | grep -q "\.${PREFER_BUNDLEID}$"; then
+					echo "$SEARCH_ROOT/$f"
+					return 0
+				  fi
+				done
+			  fi
+			  # 默认：按时间最新
+			  echo "$SEARCH_ROOT/${CANDIDATES[0]}"
+			}
+			
+			PROFILE="$(pick_profile)"
+			echo "[PICK] $PROFILE"
+			
+			#  解包为 plist
+			PLIST="$(mktemp /tmp/_pp.XXXXXX.plist)"
+			SECERR="$(mktemp /tmp/_pp.err.XXXXXX)"
 			if /usr/bin/security cms -D -i "$PROFILE" > "$PLIST" 2>"$SECERR"; then
-			  echo "security cms OK"
+			  echo "[OK] security cms -> $PLIST"
 			else
-			  echo "security cms failed:"
+			  echo "[WARN] security cms failed:"
 			  cat "$SECERR" || true
 			  if file "$PROFILE" | grep -qi 'XML'; then
-				echo "Detected XML plist; using it directly"
 				cp "$PROFILE" "$PLIST"
 			  else
 				exit 1
 			  fi
 			fi
-			
-			echo "==[VERIFY] plutil -lint =="
 			/usr/bin/plutil -lint "$PLIST"
-	
-			echo "==[UUID] PlistBuddy =="
-			UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PLIST")
-			echo "[PROFILE] UUID=$UUID"
 			
-			echo "==[INSTALL]=="
-			/bin/mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-			/usr/bin/install -m 0644 "$PROFILE" "$HOME/Library/MobileDevice/Provisioning Profiles/${UUID}.mobileprovision"
-			echo "Installed: $HOME/Library/MobileDevice/Provisioning Profiles/${UUID}.mobileprovision"
+			#  读取关键字段
+			NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PLIST")
+			UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PLIST")
+			APPID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PLIST" 2>/dev/null || echo "")
+			TEAM_FROM_ENT=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.team-identifier' "$PLIST" 2>/dev/null || echo "")
+			GET_TASK_ALLOW=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$PLIST" 2>/dev/null || echo "false")
+			PLATFORM0=$(/usr/libexec/PlistBuddy -c 'Print :Platform:0' "$PLIST" 2>/dev/null || echo "")
+			
+			TEAMID="${TEAM_FROM_ENT:-${APPID%%.*}}"
+			BUNDLEID="${APPID#*.}"
+			
+			echo "[PP] Name=$NAME"
+			echo "[PP] UUID=$UUID"
+			echo "[PP] TeamID=$TEAMID"
+			echo "[PP] BundleID=$BUNDLEID"
+			echo "[PP] get-task-allow=$GET_TASK_ALLOW"
+			echo "[PP] Platform[0]=$PLATFORM0"
+			
+			#  判定开发/发布 & 目标平台
+			if [[ "$GET_TASK_ALLOW" == "true" ]]; then
+			  PROFILE_KIND="development"
+			  CERT_KIND="Apple Development"
+			else
+			  PROFILE_KIND="distribution"
+			  CERT_KIND="Apple Distribution"
+			fi
+			
+			if echo "$PLATFORM0" | grep -qi 'xros\|visionOS'; then
+			  DESTINATION="generic/platform=visionOS"
+			else
+			  DESTINATION="generic/platform=iOS"
+			fi
+			echo "[PP] kind=$PROFILE_KIND  dest=$DESTINATION  cert=$CERT_KIND"
+			
+			#  安装 profile
+			DEST_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+			mkdir -p "$DEST_DIR"
+			/usr/bin/install -m 0644 "$PROFILE" "$DEST_DIR/${UUID}.mobileprovision"
+			echo "[INSTALL] $DEST_DIR/${UUID}.mobileprovision"
+			
+			#  自动挑选匹配证书（钥匙串需已导入带私钥的证书）
+			CODE_SIGN_IDENTITY=$(security find-identity -v -p codesigning \
+			  | awk -v kind="$CERT_KIND" -v team="$TEAMID" -F\" '$0 ~ kind && $0 ~ "\\(" team "\\)" {print $2; exit}')
+			
+			if [[ -z "${CODE_SIGN_IDENTITY:-}" ]]; then
+			  echo "[ERR] 找不到匹配证书（$CERT_KIND, Team=$TEAMID）。请确认证书+私钥已导入 login 钥匙串并解锁。"
+			  security find-identity -v -p codesigning || true
+			  exit 1
+			fi
+			echo "[CERT] $CODE_SIGN_IDENTITY"
+			
+			#  导出变量供 xcodebuild 使用（名称+UUID都导出，随你选）
+			export CPROVISIONING_PROFILE_NAME="$NAME"
+			export PROVISIONING_PROFILE_UUID="$UUID"
+			export DEVELOPMENT_TEAM="$TEAMID"
+			export PRODUCT_BUNDLE_IDENTIFIER="$BUNDLEID"
+			export CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY"
+			export DESTINATION="$DESTINATION"
+			
+			echo "[ENV] CPROVISIONING_PROFILE_NAME=$CPROVISIONING_PROFILE_NAME"
+			echo "[ENV] PRODUCT_BUNDLE_IDENTIFIER=$PRODUCT_BUNDLE_IDENTIFIER"
+			echo "[ENV] DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM"
+			echo "[ENV] CODE_SIGN_IDENTITY=$CODE_SIGN_IDENTITY"
+			echo "[ENV] DESTINATION=$DESTINATION"
 				
-		# 4) 构建（保持纯 shell；不要塞 Groovy 语句）
 				
-		CPROVISIONING_PROFILE_NAME="WangYongiOS1"
-		Project_Name="WYCICOTest5"
-		BundleID="com.WangYong2.WYCICDiOSTest"                         # <— 与后台保持一致（小写 w）
-		DEVELOPMENT_TEAM="64KDUQCYEB"
-		CODE_SIGN_IDENTITY="Apple Development: Yong Wang (LFBT5QQQ6J)"
-		Configuration="Debug"
-		project_scheme="WYCICOTest5"	
+
+		
 		project_workspace="${Project_Name}.xcworkspace"	
 		project_proj="${Project_Name}.xcodeproj"	
 		build_dir="${WORKSPACE}/build"
