@@ -243,284 +243,158 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		sh '''#!/bin/bash
 		set -euo pipefail
 		
-		echo "[PWD] $(pwd)"
-		echo "[LS]"
-		ls -la || true
+	    echo "[CHK] A: start profile lookup"
+
+		# ==== 可配置项 ====
+		SEARCH_ROOT="${WORKSPACE:-$PWD}"
+		# 注意：双引号里是一个字符串，后面会手动展开为两个模式
+		PROFILE_GLOB="${PROFILE_GLOB:-*.mobileprovision *.provisionprofile}"
+		PREFER_BUNDLEID="${PREFER_BUNDLEID:-}"
+		echo "[DBG] SEARCH_ROOT=$SEARCH_ROOT"
+		echo "[DBG] PROFILE_GLOB=$PROFILE_GLOB"
+		echo "[DBG] PREFER_BUNDLEID=$PREFER_BUNDLEID"
+		# =================
 		
-		Project_Path=""
-		# 先在当前目录查找 *.xcworkspace
-		found="$(ls -1d *.xcworkspace 2>/dev/null | head -1 || true)"
-		if [[ -n "${found}" ]]; then
-		  Project_Path="./${found}"
-		else
-		  # 再找 *.xcodeproj
-		  found="$(ls -1d *.xcodeproj 2>/dev/null | head -1 || true)"
-		  if [[ -n "${found}" ]]; then
-			Project_Path="./${found}"
-		  else
-			# 最后在下一层子目录里找一次（常见项目结构会放在子目录）
-			# 注意：BSD find 不支持 -maxdepth，这里用 ls 列出一级子目录再匹配
-			while IFS= read -r d; do
-			  f="$(ls -1d "$d"/*.xcworkspace 2>/dev/null | head -1 || true)"
-			  if [[ -n "$f" ]]; then Project_Path="$f"; break; fi
-			  f="$(ls -1d "$d"/*.xcodeproj   2>/dev/null | head -1 || true)"
-			  if [[ -n "$f" ]]; then Project_Path="$f"; break; fi
-			done < <(ls -1d */ 2>/dev/null || true)
-		  fi
-		fi
+		# 收集候选（按时间倒序）
+		echo "[CHK] B: collect candidates"
+		CANDIDATES=()
+		# 手工拆分 glob 列表，兼容 bash 3.2
+		for pat in ${PROFILE_GLOB}; do
+		  while IFS= read -r f; do
+			[ -n "$f" ] && CANDIDATES+=("$f")
+		  done < <(cd "$SEARCH_ROOT" && ls -1t $pat 2>/dev/null || true)
+		done
 		
-		if [[ -z "${Project_Path}" ]]; then
-		  echo "[ERR] 未找到 .xcworkspace 或 .xcodeproj；请确认工程在当前工作区或其一级子目录。"
+		if [ ${#CANDIDATES[@]} -eq 0 ]; then
+		  echo "[ERR] 未找到 *.mobileprovision / *.provisionprofile；请把 profile 放到仓库根或设置 PROFILE_GLOB"
 		  exit 1
 		fi
+		echo "[DBG] candidates count=${#CANDIDATES[@]}"
+		printf '  - %s\n' "${CANDIDATES[@]}"
 		
-		# 取纯名与类型
-		base="${Project_Path##*/}"     # 去前缀路径
-		Project_Kind="${base##*.}"     # xcworkspace / xcodeproj
-		Project_Name="${base%.*}"      # 去后缀
-		
-		echo "[INFO] Found path    : ${Project_Path}"
-		echo "[INFO] Project_Kind  : ${Project_Kind}"
-		echo "[INFO] Project_Name  : ${Project_Name}"
-		
-		# 写到文件供后续步骤使用
-		{
-		  echo "Project_Path=${Project_Path}"
-		  echo "Project_Kind=${Project_Kind}"
-		  echo "Project_Name=${Project_Name}"
-		} > .xproj.detected
-		
-		# （可选）列出 schemes / configurations 方便确认
-		if [[ "${Project_Kind}" == "xcworkspace" ]]; then
-		  xcodebuild -list -workspace "${Project_Path}" || true
-		else
-		  xcodebuild -list -project "${Project_Path}" || true
-		fi
-		
-				
-
-			
-			
-		# 检测 workspace 或 project
-		if [ -d "${Project_Name}.xcworkspace" ]; then
-		  echo "[INFO] Detected workspace: ${Project_Name}.xcworkspace"
-		  project_scheme=$(xcodebuild -list -workspace "${Project_Name}.xcworkspace" \
-			| awk '/Schemes:/{flag=1;next}/^$/{flag=0}flag' \
-			| head -1 | xargs)
-		else
-		  echo "[INFO] Detected project: ${Project_Name}.xcodeproj"
-		  project_scheme=$(xcodebuild -list -project "${Project_Name}.xcodeproj" \
-			| awk '/Schemes:/{flag=1;next}/^$/{flag=0}flag' \
-			| head -1 | xargs)
-		fi
-		echo "[INFO] project_scheme=$project_scheme"
-		
-		# 自动获取第一个 Build Configuration
-		if [ -d "${Project_Name}.xcworkspace" ]; then
-		  Configuration=$(xcodebuild -list -workspace "${Project_Name}.xcworkspace" \
-			| awk '/Build Configurations:/{flag=1;next}/If no build configuration/{flag=0}flag' \
-			| head -1 | xargs)
-		else
-		  Configuration=$(xcodebuild -list -project "${Project_Name}.xcodeproj" \
-			| awk '/Build Configurations:/{flag=1;next}/If no build configuration/{flag=0}flag' \
-			| head -1 | xargs)
-		fi
-		echo "[INFO] Configuration=$Configuration"
-			
-			
-			# ========== 可配置项（也可在 Jenkins 环境变量里覆盖） ==========
-			SEARCH_ROOT="${WORKSPACE:-$PWD}"           # 在哪个目录查找（默认工作区）
-			PROFILE_GLOB="${PROFILE_GLOB:-*.mobileprovision *.provisionprofile}"  # 查找模式
-			PREFER_BUNDLEID="${PREFER_BUNDLEID:-}"     # 若想优先选择某个 BundleID 的 profile，可设置它；留空则按修改时间最新
-			# ============================================================
-			
-			cat > _pick_profile.sh <<'BASH'
-			set -euo pipefail
-			
-			SEARCH_ROOT="${SEARCH_ROOT:-$PWD}"
-			PROFILE_GLOB=${PROFILE_GLOB:-"*.mobileprovision *.provisionprofile"}
-			PREFER_BUNDLEID="${PREFER_BUNDLEID:-}"
-			
-			# 收集候选（按时间倒序），兼容 bash 3.2
-			CANDIDATES=()
-			# shellcheck disable=SC2086
-			while IFS= read -r f; do
-			  [ -n "$f" ] && CANDIDATES+=("$f")
-			done < <(cd "$SEARCH_ROOT" && ls -1t ${PROFILE_GLOB} 2>/dev/null || true)
-			
-			if [ ${#CANDIDATES[@]} -eq 0 ]; then
-			  echo "[ERR] 没找到 *.mobileprovision / *.provisionprofile；请把 profile 放到仓库里或设置 PROFILE_GLOB"
-			  exit 1
-			fi
-			
-			# 读取 APPID（TEAMID.bundleid），兼容纯 XML 情况
-			read_appid() {
-			  local pf="$1" tmp err
-			  tmp="$(mktemp /tmp/_pp.XXXXXX.plist)"
-			  err="$(mktemp /tmp/_pp.err.XXXXXX)"
-			  if /usr/bin/security cms -D -i "$pf" >"$tmp" 2>"$err"; then
-				: # ok
-			  else
-				if file "$pf" | grep -qi 'XML'; then
-				  cp "$pf" "$tmp"
-				else
-				  rm -f "$tmp" "$err"
-				  return 1
-				fi
-			  fi
-			  APPID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$tmp" 2>/dev/null || echo "")
+		# 读取 profile 的 application-identifier （TEAMID.bundleid）
+		read_appid() {
+		  local pf="$1" tmp err
+		  tmp="$(mktemp /tmp/_pp.XXXXXX.plist)"
+		  err="$(mktemp /tmp/_pp.err.XXXXXX)"
+		  if /usr/bin/security cms -D -i "$pf" >"$tmp" 2>"$err"; then
+			:  # OK
+		  else
+			echo "[WARN] security cms failed on $pf:"
+			cat "$err" || true
+			if file "$pf" | grep -qi 'XML'; then
+			  cp "$pf" "$tmp"
+			else
 			  rm -f "$tmp" "$err"
-			  [ -n "$APPID" ]
-			}
-			
-			pick_profile() {
-			  local f pf
-			
-			  # 有 PREFER_BUNDLEID 时，先精确匹配（用 shell 通配判断，避免正则转义问题）
-			  if [ -n "$PREFER_BUNDLEID" ]; then
-				for f in "${CANDIDATES[@]}"; do
-				  pf="$SEARCH_ROOT/$f"
-				  if read_appid "$pf"; then
-					# APPID 形如 TEAMID.com.xxx.yyy
-					local bid="${APPID#*.}"
-					if [ "$bid" = "$PREFER_BUNDLEID" ]; then
-					  printf '%s\n' "$pf"
-					  return 0
-					fi
-				  fi
-				done
-			  fi
-			
-			  # 否则按时间最新
-			  printf '%s\n' "$SEARCH_ROOT/${CANDIDATES[0]}"
-			  return 0
-			}
-			
-			PROFILE="$(pick_profile)"
-			echo "[PICK] $PROFILE"
-			# 回传路径给外层
-			printf '%s' "$PROFILE" > _picked_profile.path
-			BASH
-			
-			# 执行子脚本
-			SEARCH_ROOT="$SEARCH_ROOT" PROFILE_GLOB="$PROFILE_GLOB" PREFER_BUNDLEID="$PREFER_BUNDLEID" bash _pick_profile.sh
-			
-			PROFILE="$(cat _picked_profile.path)"
-			echo "[PICK] $PROFILE"
-			
-			
-			#  解包为 plist
-			PLIST="$(mktemp /tmp/_pp.XXXXXX.plist)"
-			SECERR="$(mktemp /tmp/_pp.err.XXXXXX)"
-			if /usr/bin/security cms -D -i "$PROFILE" > "$PLIST" 2>"$SECERR"; then
-			  echo "[OK] security cms -> $PLIST"
-			else
-			  echo "[WARN] security cms failed:"
-			  cat "$SECERR" || true
-			  if file "$PROFILE" | grep -qi 'XML'; then
-				cp "$PROFILE" "$PLIST"
-			  else
-				exit 1
+			  return 1
+			fi
+		  fi
+		  APPID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$tmp" 2>/dev/null || echo "")
+		  rm -f "$tmp" "$err"
+		  [ -n "$APPID" ]
+		}
+		
+		# 选择 profile：优先匹配 PREFER_BUNDLEID，否则取最新
+		echo "[CHK] C: pick profile"
+		PROFILE=""
+		if [ -n "$PREFER_BUNDLEID" ]; then
+		  for f in "${CANDIDATES[@]}"; do
+			pf="$SEARCH_ROOT/$f"
+			if read_appid "$pf"; then
+			  bid="${APPID#*.}"
+			  if [ "$bid" = "$PREFER_BUNDLEID" ]; then
+				PROFILE="$pf"
+				break
 			  fi
 			fi
-			/usr/bin/plutil -lint "$PLIST"
-			
-			#  读取关键字段
-			NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PLIST")
-			UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PLIST")
-			APPID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PLIST" 2>/dev/null || echo "")
-			TEAM_FROM_ENT=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.team-identifier' "$PLIST" 2>/dev/null || echo "")
-			GET_TASK_ALLOW=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$PLIST" 2>/dev/null || echo "false")
-			PLATFORM0=$(/usr/libexec/PlistBuddy -c 'Print :Platform:0' "$PLIST" 2>/dev/null || echo "")
-			
-			TEAMID="${TEAM_FROM_ENT:-${APPID%%.*}}"
-			BUNDLEID="${APPID#*.}"
-			
-			echo "[PP] Name=$NAME"
-			echo "[PP] UUID=$UUID"
-			echo "[PP] TeamID=$TEAMID"
-			echo "[PP] BundleID=$BUNDLEID"
-			echo "[PP] get-task-allow=$GET_TASK_ALLOW"
-			echo "[PP] Platform[0]=$PLATFORM0"
-			
-			#  判定开发/发布 & 目标平台
-			if [[ "$GET_TASK_ALLOW" == "true" ]]; then
-			  PROFILE_KIND="development"
-			  CERT_KIND="Apple Development"
-			else
-			  PROFILE_KIND="distribution"
-			  CERT_KIND="Apple Distribution"
-			fi
-			
-			if echo "$PLATFORM0" | grep -Eqi 'xros|visionOS'; then
-			  DESTINATION="generic/platform=visionOS"
-			else
-			  DESTINATION="generic/platform=iOS"
-			fi
-			echo "[PP] kind=$PROFILE_KIND  dest=$DESTINATION  cert=$CERT_KIND"
-			
-			#  安装 profile
-			DEST_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
-			mkdir -p "$DEST_DIR"
-			/usr/bin/install -m 0644 "$PROFILE" "$DEST_DIR/${UUID}.mobileprovision"
-			echo "[INSTALL] $DEST_DIR/${UUID}.mobileprovision"
-			
-			#  自动挑选匹配证书（钥匙串需已导入带私钥的证书）
-			CODE_SIGN_IDENTITY=$(security find-identity -v -p codesigning \
-			  | awk -v kind="$CERT_KIND" -v team="$TEAMID" -F\" '$0 ~ kind && $0 ~ "\\(" team "\\)" {print $2; exit}')
-			
-			if [[ -z "${CODE_SIGN_IDENTITY:-}" ]]; then
-			  echo "[ERR] 找不到匹配证书（$CERT_KIND, Team=$TEAMID）。请确认证书+私钥已导入 login 钥匙串并解锁。"
-			  security find-identity -v -p codesigning || true
-			  exit 1
-			fi
-			echo "[CERT] $CODE_SIGN_IDENTITY"
-			
-			#  导出变量供 xcodebuild 使用（名称+UUID都导出，随你选）
-			export CPROVISIONING_PROFILE_NAME="$NAME"
-			export PROVISIONING_PROFILE_UUID="$UUID"
-			export DEVELOPMENT_TEAM="$TEAMID"
-			export PRODUCT_BUNDLE_IDENTIFIER="$BUNDLEID"
-			export CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY"
-			export DESTINATION="$DESTINATION"
-			
-			echo "[ENV] CPROVISIONING_PROFILE_NAME=$CPROVISIONING_PROFILE_NAME"
-			echo "[ENV] PRODUCT_BUNDLE_IDENTIFIER=$PRODUCT_BUNDLE_IDENTIFIER"
-			echo "[ENV] DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM"
-			echo "[ENV] CODE_SIGN_IDENTITY=$CODE_SIGN_IDENTITY"
-			echo "[ENV] DESTINATION=$DESTINATION"
-				
-				
-
-		
-		project_workspace="${Project_Name}.xcworkspace"	
-		project_proj="${Project_Name}.xcodeproj"	
-		build_dir="${WORKSPACE}/build"
-		archive_path="${build_dir}/${project_scheme}.xcarchive"
-		export_path="${HOME}/project/build/${Project_Name}"
-		exportOptionsPlist="${build_dir}/${project_scheme}.plist"	
-		
-		mkdir -p "${build_dir}" "${export_path}"
-				
-		# 记录变量
-		cat > BuildVariable <<EOF
-		project_workspace=${project_workspace}
-		project_scheme=${project_scheme}
-		export_path=${export_path}
-		build_dir=${build_dir}
-		archive_path=${archive_path}
-		exportOptionsPlist=${exportOptionsPlist}
-EOF
-		
-		if [ -f "$project_workspace" ]; then
-		  echo "[BUILD] Use workspace: $project_workspace"
-		  xcodebuild -list -workspace "$project_workspace" || true
-		  SRC_OPTS=(-workspace "$project_workspace")
-		else
-		  echo "[BUILD] Use project: $project_proj"
-		  xcodebuild -list -project "$project_proj" || true
-		  SRC_OPTS=(-project "$project_proj")
+		  done
 		fi
+		if [ -z "$PROFILE" ]; then
+		  PROFILE="$SEARCH_ROOT/${CANDIDATES[0]}"
+		fi
+		echo "[PICK] $PROFILE"
+		[ -f "$PROFILE" ] || { echo "[ERR] PROFILE 文件不存在：$PROFILE"; exit 1; }
+		
+		# 解包 plist
+		echo "[CHK] D: decode profile"
+		PLIST="$(mktemp /tmp/_pp.XXXXXX.plist)"
+		if /usr/bin/security cms -D -i "$PROFILE" > "$PLIST" 2>/dev/null; then
+		  :
+		else
+		  if file "$PROFILE" | grep -qi 'XML'; then
+			cp "$PROFILE" "$PLIST"
+		  else
+			echo "[ERR] 无法解析 provisioning profile：$PROFILE"
+			exit 1
+		  fi
+		fi
+		/usr/bin/plutil -lint "$PLIST"
+		
+		# 取关键字段
+		NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PLIST")
+		UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PLIST")
+		APPID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PLIST" 2>/dev/null || echo "")
+		TEAM_FROM_ENT=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.team-identifier' "$PLIST" 2>/dev/null || echo "")
+		GET_TASK_ALLOW=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$PLIST" 2>/dev/null || echo "false")
+		PLATFORM0=$(/usr/libexec/PlistBuddy -c 'Print :Platform:0' "$PLIST" 2>/dev/null || echo "")
+		
+		TEAMID="${TEAM_FROM_ENT:-${APPID%%.*}}"
+		BUNDLEID="${APPID#*.}"
+		
+		echo "[PP] Name=$NAME"
+		echo "[PP] UUID=$UUID"
+		echo "[PP] TeamID=$TEAMID"
+		echo "[PP] BundleID=$BUNDLEID"
+		echo "[PP] get-task-allow=$GET_TASK_ALLOW"
+		echo "[PP] Platform[0]=$PLATFORM0"
+		
+		# 判定证书类型与目的平台
+		if [ "$GET_TASK_ALLOW" = "true" ]; then
+		  PROFILE_KIND="development"
+		  CERT_KIND="Apple Development"
+		else
+		  PROFILE_KIND="distribution"
+		  CERT_KIND="Apple Distribution"
+		fi
+		if echo "$PLATFORM0" | grep -Eqi 'xros|visionOS'; then
+		  DESTINATION="generic/platform=visionOS"
+		else
+		  DESTINATION="generic/platform=iOS"
+		fi
+		echo "[PP] kind=$PROFILE_KIND  dest=$DESTINATION  cert=$CERT_KIND"
+		
+		# 安装 profile
+		DEST_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+		mkdir -p "$DEST_DIR"
+		install -m 0644 "$PROFILE" "$DEST_DIR/${UUID}.mobileprovision"
+		echo "[INSTALL] $DEST_DIR/${UUID}.mobileprovision"
+		
+		# 选择匹配证书（需要你已导入带私钥证书并解锁 login 钥匙串）
+		echo "[CHK] E: pick signing identity"
+		CODE_SIGN_IDENTITY=$(security find-identity -v -p codesigning \
+		  | awk -v kind="$CERT_KIND" -v team="$TEAMID" -F\" '$0 ~ kind && $0 ~ "\\(" team "\\)" {print $2; exit}')
+		if [ -z "${CODE_SIGN_IDENTITY:-}" ]; then
+		  echo "[ERR] 找不到匹配证书（$CERT_KIND, Team=$TEAMID）。"
+		  security find-identity -v -p codesigning || true
+		  exit 1
+		fi
+		echo "[CERT] $CODE_SIGN_IDENTITY"
+		
+		# 导出环境变量供后续 xcodebuild
+		export CPROVISIONING_PROFILE_NAME="$NAME"
+		export PROVISIONING_PROFILE_UUID="$UUID"
+		export DEVELOPMENT_TEAM="$TEAMID"
+		export PRODUCT_BUNDLE_IDENTIFIER="$BUNDLEID"
+		export CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY"
+		export DESTINATION="$DESTINATION"
+		
+		echo "[ENV] CPROVISIONING_PROFILE_NAME=$CPROVISIONING_PROFILE_NAME"
+		echo "[ENV] PRODUCT_BUNDLE_IDENTIFIER=$PRODUCT_BUNDLE_IDENTIFIER"
+		echo "[ENV] DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM"
+		echo "[ENV] CODE_SIGN_IDENTITY=$CODE_SIGN_IDENTITY"
+		echo "[ENV] DESTINATION=$DESTINATION"
+		
+		echo "[CHK] F: profile ready, go build…"
 		
 		echo "check3"
 		
