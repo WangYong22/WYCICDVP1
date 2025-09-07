@@ -469,11 +469,16 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		echo "$SCHEMES" | sed -e 's/^/  | /'
 		echo "[DBG] <<< raw output end"
 		
-		# 从输出里提取 schemes 部分
-		PARSED=$(printf '%s\n' "$SCHEMES" | awk '
-		  $0 ~ /^Schemes:/ {inlist=1; next}
-		  inlist && NF==0   {inlist=0}
-		  inlist {print}')
+		# 从输出里提取 schemes 部分 —— 忽略前导空格并去掉回车
+		PARSED=$(
+		  printf '%s\n' "$SCHEMES" \
+		  | tr -d '\r' \
+		  | awk '
+			  /^[[:space:]]*Schemes:/ {inlist=1; next}
+			  inlist && /^[[:space:]]*$/ {inlist=0}
+			  inlist { sub(/^[[:space:]]+/, "", $0); print }
+			'
+		)
 		
 		echo "[DBG] Step C: parsed schemes candidates (before filter):"
 		printf '  - %s\n' $PARSED
@@ -488,7 +493,7 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		echo "[DBG] Step D: after removing *Tests"
 		printf '  - %s\n' "${SCHEME_CAND[@]:-<none>}"
 		
-		# 如果全部都是 *Tests，就退回原始
+		# 如果被过滤光了，就用原始 PARSED
 		if [ ${#SCHEME_CAND[@]} -eq 0 ]; then
 		  echo "[WARN] Step E: no schemes survived filtering, fallback to raw list"
 		  while IFS= read -r s; do
@@ -500,11 +505,7 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		echo "[DBG] Step F: final scheme candidates:"
 		printf '  - %s\n' "${SCHEME_CAND[@]:-<none>}"
 		
-		# 最终检查
-		if [ ${#SCHEME_CAND[@]} -eq 0 ]; then
-		  echo "[ERR] 未找到任何 Scheme"
-		  exit 1
-		fi
+		[ ${#SCHEME_CAND[@]} -gt 0 ] || { echo "[ERR] 未找到任何 Scheme"; exit 1; }
 		
 		# 选择：优先与工程同名，否则第一个
 		auto_scheme="${SCHEME_CAND[0]}"
