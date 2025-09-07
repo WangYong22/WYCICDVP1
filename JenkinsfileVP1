@@ -247,28 +247,37 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		echo "[LS]"
 		ls -la || true
 		
-		# 在当前目录优先找 .xcworkspace；没有就找 .xcodeproj（仅在当前目录，必要时再扩到下一层）
 		Project_Path=""
-		if found=$(find . -maxdepth 1 -type d -name "*.xcworkspace" -print -quit 2>/dev/null); then
-		  Project_Path="$found"
-		elif found=$(find . -maxdepth 1 -type d -name "*.xcodeproj" -print -quit 2>/dev/null); then
-		  Project_Path="$found"
+		# 先在当前目录查找 *.xcworkspace
+		found="$(ls -1d *.xcworkspace 2>/dev/null | head -1 || true)"
+		if [[ -n "${found}" ]]; then
+		  Project_Path="./${found}"
 		else
-		  # 往下一层再找一次，防止工程放在子目录（如 ios/）
-		  if found=$(find . -maxdepth 2 -type d \\( -name "*.xcworkspace" -o -name "*.xcodeproj" \\) -print -quit 2>/dev/null); then
-			Project_Path="$found"
+		  # 再找 *.xcodeproj
+		  found="$(ls -1d *.xcodeproj 2>/dev/null | head -1 || true)"
+		  if [[ -n "${found}" ]]; then
+			Project_Path="./${found}"
+		  else
+			# 最后在下一层子目录里找一次（常见项目结构会放在子目录）
+			# 注意：BSD find 不支持 -maxdepth，这里用 ls 列出一级子目录再匹配
+			while IFS= read -r d; do
+			  f="$(ls -1d "$d"/*.xcworkspace 2>/dev/null | head -1 || true)"
+			  if [[ -n "$f" ]]; then Project_Path="$f"; break; fi
+			  f="$(ls -1d "$d"/*.xcodeproj   2>/dev/null | head -1 || true)"
+			  if [[ -n "$f" ]]; then Project_Path="$f"; break; fi
+			done < <(ls -1d */ 2>/dev/null || true)
 		  fi
 		fi
 		
 		if [[ -z "${Project_Path}" ]]; then
-		  echo "[ERR] 未找到 .xcworkspace 或 .xcodeproj 目录；请确认工程在当前工作区内。"
+		  echo "[ERR] 未找到 .xcworkspace 或 .xcodeproj；请确认工程在当前工作区或其一级子目录。"
 		  exit 1
 		fi
 		
 		# 取纯名与类型
-		base="${Project_Path##*/}"   # 去掉前缀路径
-		Project_Kind="${base##*.}"   # xcworkspace / xcodeproj
-		Project_Name="${base%.*}"    # 去掉后缀
+		base="${Project_Path##*/}"     # 去前缀路径
+		Project_Kind="${base##*.}"     # xcworkspace / xcodeproj
+		Project_Name="${base%.*}"      # 去后缀
 		
 		echo "[INFO] Found path    : ${Project_Path}"
 		echo "[INFO] Project_Kind  : ${Project_Kind}"
@@ -281,13 +290,14 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		  echo "Project_Name=${Project_Name}"
 		} > .xproj.detected
 		
-		# （可选）列一下 schemes / configurations 方便确认
+		# （可选）列出 schemes / configurations 方便确认
 		if [[ "${Project_Kind}" == "xcworkspace" ]]; then
 		  xcodebuild -list -workspace "${Project_Path}" || true
 		else
 		  xcodebuild -list -project "${Project_Path}" || true
 		fi
 		
+				
 
 			
 			
