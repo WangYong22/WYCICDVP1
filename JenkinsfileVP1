@@ -370,37 +370,57 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		echo "[INSTALL] $DEST_DIR/${UUID}.mobileprovision"
 		
 		# 选择匹配证书（需要你已导入带私钥证书并解锁 login 钥匙串）
-		echo "[CHK] E: pick signing identity (AK-only, no sed)"
+		echo "[CHK] E: pick signing identity (robust matcher)"
 
-		# 可选：若你明确想用某个证书的可读名称（CN），可以提前导出：
+		# 可选：显式指定证书可读名称（最可靠）
 		# export CERT_CN='Apple Development: Yong Wang (LFBT5QQQ6J)'
 		
-		# 先把所有 codesign 证书列出来，避免多次调用
 		ALL_IDS="$(security find-identity -v -p codesigning 2>/dev/null || true)"
-		echo "[DBG] identities:"
-		echo "$ALL_IDS" | sed -e 's/^/  /'
+		echo "[DBG] identities raw:"
+		printf '%s\n' "$ALL_IDS" | sed -e 's/^/  /'
+		
+		pick_by_cn() {
+		  # 精确用证书可读名称匹配（CN）
+		  printf '%s\n' "$ALL_IDS" | awk -v cn="$CERT_CN" -F'"' '$0 ~ cn {print $2; exit}'
+		}
+		
+		pick_by_kind_team() {
+		  # 同时匹配证书类型 + (TEAMID) —— 某些系统输出里没有(TEAMID)，可能匹配不到
+		  printf '%s\n' "$ALL_IDS" | awk -v k="$CERT_KIND" -v t="$TEAMID" -F'"' \
+			  'index($0,k) && index($0,"(" t ")") {print $2; exit}'
+		}
+		
+		pick_by_kind_only() {
+		  # 只匹配证书类型（如 Apple Development），取第一张
+		  printf '%s\n' "$ALL_IDS" | awk -v k="$CERT_KIND" -F'"' \
+			  'index($0,k) {print $2; exit}'
+		}
+		
+		CODE_SIGN_IDENTITY=""
 		
 		if [ -n "${CERT_CN:-}" ]; then
-		  # 如果你显式指定了证书名（CN），优先用这个
-		  CODE_SIGN_IDENTITY=$(printf '%s\n' "$ALL_IDS" \
-			| awk -v cn="$CERT_CN" -F'"' '$0 ~ cn {print $2; exit}')
-		else
-		  # 否则按 证书类型 + TeamID 匹配第一条
-		  # 例：Apple Development + (64KDUQCYEB)
-		  CODE_SIGN_IDENTITY=$(printf '%s\n' "$ALL_IDS" \
-			| awk -v k="$CERT_KIND" -v t="$TEAMID" -F'"' \
-				'index($0,k) && index($0,"(" t ")") {print $2; exit}')
+		  CODE_SIGN_IDENTITY="$(pick_by_cn)"
+		  echo "[DBG] pick_by_cn => ${CODE_SIGN_IDENTITY:-<empty>}"
 		fi
 		
-		echo "[CERT] picked: ${CODE_SIGN_IDENTITY:-<empty>}"
+		if [ -z "$CODE_SIGN_IDENTITY" ]; then
+		  CODE_SIGN_IDENTITY="$(pick_by_kind_team)"
+		  echo "[DBG] pick_by_kind_team => ${CODE_SIGN_IDENTITY:-<empty>}"
+		fi
 		
-		if [ -z "${CODE_SIGN_IDENTITY:-}" ]; then
-		  echo "[ERR] 找不到匹配证书（kind=$CERT_KIND, team=$TEAMID）。"
-		  echo "      你也可以显式指定： export CERT_CN='Apple Development: Yong Wang (LFBT5QQQ6J)'"
+		if [ -z "$CODE_SIGN_IDENTITY" ]; then
+		  CODE_SIGN_IDENTITY="$(pick_by_kind_only)"
+		  echo "[DBG] pick_by_kind_only => ${CODE_SIGN_IDENTITY:-<empty>}"
+		fi
+		
+		if [ -z "$CODE_SIGN_IDENTITY" ]; then
+		  echo "[ERR] 仍然找不到匹配证书（kind=$CERT_KIND, team=$TEAMID）。"
+		  echo "      你可以显式指定： export CERT_CN='Apple Development: Yong Wang (LFBT5QQQ6J)'"
 		  exit 1
 		fi
 		
-		echo "[CERT] $CODE_SIGN_IDENTITY"
+		echo "[CERT] picked: $CODE_SIGN_IDENTITY"
+		
 		
 		# —— 这些变量若未定义，这里统一给兜底，避免 set -u 触发 ——
 		: "${Project_Name:?Project_Name 未定义}"
