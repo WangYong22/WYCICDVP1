@@ -429,146 +429,173 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		: "${WORKSPACE:=$PWD}"
 		
 		# 1) 找到工程路径（优先 .xcworkspace）
-		Project_Path=""
-		# 先当前目录
-		if compgen -G "*.xcworkspace" >/dev/null; then
-		  Project_Path="./$(ls -1d *.xcworkspace | head -1)"
-		elif compgen -G "*.xcodeproj" >/dev/null; then
-		  Project_Path="./$(ls -1d *.xcodeproj   | head -1)"
-		else
-		  # 再找一级子目录
-		  while IFS= read -r d; do
-			[ -d "$d" ] || continue
-			if compgen -G "$d"*.xcworkspace >/dev/null; then
-			  Project_Path="$(ls -1d "$d"*.xcworkspace | head -1)"; break
-			elif compgen -G "$d"*.xcodeproj >/dev/null; then
-			  Project_Path="$(ls -1d "$d"*.xcodeproj   | head -1)"; break
+			Project_Path=""
+			# 先当前目录
+			if compgen -G "*.xcworkspace" >/dev/null; then
+			  Project_Path="./$(ls -1d *.xcworkspace | head -1)"
+			elif compgen -G "*.xcodeproj" >/dev/null; then
+			  Project_Path="./$(ls -1d *.xcodeproj   | head -1)"
+			else
+			  # 再找一级子目录
+			  while IFS= read -r d; do
+				[ -d "$d" ] || continue
+				if compgen -G "$d"*.xcworkspace >/dev/null; then
+				  Project_Path="$(ls -1d "$d"*.xcworkspace | head -1)"; break
+				elif compgen -G "$d"*.xcodeproj >/dev/null; then
+				  Project_Path="$(ls -1d "$d"*.xcodeproj   | head -1)"; break
+				fi
+			  done < <(ls -1d */ 2>/dev/null || true)
 			fi
-		  done < <(ls -1d */ 2>/dev/null || true)
-		fi
-		
-		[ -n "$Project_Path" ] || { echo "[ERR] 未找到 .xcworkspace 或 .xcodeproj"; exit 1; }
-		
-		base="${Project_Path##*/}"            # 去前缀路径
-		Project_Kind="${base##*.}"            # xcworkspace / xcodeproj
-		Project_Name="${base%.*}"             # 去后缀
-		echo "[INFO] Project_Path=$Project_Path"
-		echo "[INFO] Project_Kind=$Project_Kind"
-		echo "[INFO] Project_Name=$Project_Name"
+			
+			[ -n "$Project_Path" ] || { echo "[ERR] 未找到 .xcworkspace 或 .xcodeproj"; exit 1; }
+			
+			base="${Project_Path##*/}"            # 去前缀路径
+			Project_Kind="${base##*.}"            # xcworkspace / xcodeproj
+			Project_Name="${base%.*}"             # 去后缀
+			echo "[INFO] Project_Path=$Project_Path"
+			echo "[INFO] Project_Kind=$Project_Kind"
+			echo "[INFO] Project_Name=$Project_Name"
 		
 		# 2) 解析 schemes（排除 *Tests，优先与工程同名）
-		echo "[DBG] Step A: list schemes from $Project_Kind"
-
-		if [[ "$Project_Kind" == "xcworkspace" ]]; then
-		  SCHEMES=$(xcodebuild -list -workspace "$Project_Path" 2>&1)
-		else
-		  SCHEMES=$(xcodebuild -list -project "$Project_Path" 2>&1)
-		fi
+			echo "[DBG] Step A: list schemes from $Project_Kind"
+	
+			if [[ "$Project_Kind" == "xcworkspace" ]]; then
+			  SCHEMES=$(xcodebuild -list -workspace "$Project_Path" 2>&1)
+			else
+			  SCHEMES=$(xcodebuild -list -project "$Project_Path" 2>&1)
+			fi
+			
+			echo "[DBG] Step B: raw xcodebuild -list output >>>"
+			echo "$SCHEMES" | sed -e 's/^/  | /'
+			echo "[DBG] <<< raw output end"
+			
+			# 从输出里提取 schemes 部分 —— 忽略前导空格并去掉回车
+			PARSED=$(
+			  printf '%s\n' "$SCHEMES" \
+			  | tr -d '\r' \
+			  | awk '
+				  /^[[:space:]]*Schemes:/ {inlist=1; next}
+				  inlist && /^[[:space:]]*$/ {inlist=0}
+				  inlist { sub(/^[[:space:]]+/, "", $0); print }
+				'
+			)
+			
+			echo "[DBG] Step C: parsed schemes candidates (before filter):"
+			printf '  - %s\n' $PARSED
+			
+			# 去掉 *Tests
+			SCHEME_CAND=()
+			while IFS= read -r s; do
+			  s="$(echo "$s" | xargs)"
+			  [ -n "$s" ] && SCHEME_CAND+=("$s")
+			done < <(printf '%s\n' "$PARSED" | grep -v 'Tests$' || true)
+			
+			echo "[DBG] Step D: after removing *Tests"
+			printf '  - %s\n' "${SCHEME_CAND[@]:-<none>}"
+			
+			# 如果被过滤光了，就用原始 PARSED
+			if [ ${#SCHEME_CAND[@]} -eq 0 ]; then
+			  echo "[WARN] Step E: no schemes survived filtering, fallback to raw list"
+			  while IFS= read -r s; do
+				s="$(echo "$s" | xargs)"
+				[ -n "$s" ] && SCHEME_CAND+=("$s")
+			  done < <(printf '%s\n' "$PARSED")
+			fi
+			
+			echo "[DBG] Step F: final scheme candidates:"
+			printf '  - %s\n' "${SCHEME_CAND[@]:-<none>}"
+			
+			[ ${#SCHEME_CAND[@]} -gt 0 ] || { echo "[ERR] 未找到任何 Scheme"; exit 1; }
+			
+			# 选择：优先与工程同名，否则第一个
+			auto_scheme="${SCHEME_CAND[0]}"
+			for s in "${SCHEME_CAND[@]}"; do
+			  if [ "$s" = "$Project_Name" ]; then auto_scheme="$s"; break; fi
+			done
+			
+			# 若已外部指定 project_scheme，则尊重；否则用自动结果
+			: "${project_scheme:=$auto_scheme}"
+			echo "[INFO] project_scheme=$project_scheme"
 		
-		echo "[DBG] Step B: raw xcodebuild -list output >>>"
-		echo "$SCHEMES" | sed -e 's/^/  | /'
-		echo "[DBG] <<< raw output end"
 		
-		# 从输出里提取 schemes 部分 —— 忽略前导空格并去掉回车
-		PARSED=$(
-		  printf '%s\n' "$SCHEMES" \
-		  | tr -d '\r' \
-		  | awk '
-			  /^[[:space:]]*Schemes:/ {inlist=1; next}
-			  inlist && /^[[:space:]]*$/ {inlist=0}
-			  inlist { sub(/^[[:space:]]+/, "", $0); print }
-			'
-		)
 		
-		echo "[DBG] Step C: parsed schemes candidates (before filter):"
-		printf '  - %s\n' $PARSED
-		
-		# 去掉 *Tests
-		SCHEME_CAND=()
-		while IFS= read -r s; do
-		  s="$(echo "$s" | xargs)"
-		  [ -n "$s" ] && SCHEME_CAND+=("$s")
-		done < <(printf '%s\n' "$PARSED" | grep -v 'Tests$' || true)
-		
-		echo "[DBG] Step D: after removing *Tests"
-		printf '  - %s\n' "${SCHEME_CAND[@]:-<none>}"
-		
-		# 如果被过滤光了，就用原始 PARSED
-		if [ ${#SCHEME_CAND[@]} -eq 0 ]; then
-		  echo "[WARN] Step E: no schemes survived filtering, fallback to raw list"
-		  while IFS= read -r s; do
-			s="$(echo "$s" | xargs)"
-			[ -n "$s" ] && SCHEME_CAND+=("$s")
-		  done < <(printf '%s\n' "$PARSED")
-		fi
-		
-		echo "[DBG] Step F: final scheme candidates:"
-		printf '  - %s\n' "${SCHEME_CAND[@]:-<none>}"
-		
-		[ ${#SCHEME_CAND[@]} -gt 0 ] || { echo "[ERR] 未找到任何 Scheme"; exit 1; }
-		
-		# 选择：优先与工程同名，否则第一个
-		auto_scheme="${SCHEME_CAND[0]}"
-		for s in "${SCHEME_CAND[@]}"; do
-		  if [ "$s" = "$Project_Name" ]; then auto_scheme="$s"; break; fi
-		done
-		
-		# 若已外部指定 project_scheme，则尊重；否则用自动结果
-		: "${project_scheme:=$auto_scheme}"
-		echo "[INFO] project_scheme=$project_scheme"
-		
-		# 3) 解析 Build Configurations（优先 Debug）
-		if [[ "$Project_Kind" == "xcworkspace" ]]; then
-		  CFGS=$(xcodebuild -list -workspace "$Project_Path" 2>/dev/null | awk '
-			$0 ~ /^Build Configurations:/ {inlist=1; next}
-			inlist && $0 ~ /^If no build configuration/ {inlist=0}
-			inlist {print}')
-		else
-		  CFGS=$(xcodebuild -list -project   "$Project_Path" 2>/dev/null | awk '
-			$0 ~ /^Build Configurations:/ {inlist=1; next}
-			inlist && $0 ~ /^If no build configuration/ {inlist=0}
-			inlist {print}')
-		fi
-		
-		CFG_CAND=()
-		while IFS= read -r c; do
-		  c="$(echo "$c" | xargs)"
-		  [ -n "$c" ] && CFG_CAND+=("$c")
-		done < <(printf '%s\n' "$CFGS")
-		
-		[ ${#CFG_CAND[@]} -gt 0 ] || { echo "[ERR] 未找到 Build Configurations"; exit 1; }
-		
-		auto_cfg="${CFG_CAND[0]}"
-		for c in "${CFG_CAND[@]}"; do
-		  if [ "$c" = "Debug" ]; then auto_cfg="$c"; break; fi
-		done
-		
-		: "${Configuration:=$auto_cfg}"
-		echo "[INFO] Configuration=$Configuration"
-		
-		# 4) 供后续使用的源参数（workspace / project）
-		if [[ "$Project_Kind" == "xcworkspace" ]]; then
-		  project_workspace="$Project_Path"
-		  SRC_OPTS=(-workspace "$project_workspace")
-		else
-		  project_proj="$Project_Path"
-		  SRC_OPTS=(-project "$project_proj")
-		fi
-		
-		# 落盘，给后续 step 复用（可选）
-		{
-		  echo "Project_Path=$Project_Path"
-		  echo "Project_Kind=$Project_Kind"
-		  echo "Project_Name=$Project_Name"
-		  echo "project_scheme=$project_scheme"
-		  echo "Configuration=$Configuration"
-		  if [[ "$Project_Kind" == "xcworkspace" ]]; then
-			echo "project_workspace=$project_workspace"
-		  else
-			echo "project_proj=$project_proj"
-		  fi
-		} > .xproj.auto
-		# ====== /自动探测 ======
+		# 3) 解析 Build Configurations（优先 Debug）——加检查点 & 兼容缩进/CR
+			echo "[CFG] Step A: run xcodebuild -list to get configurations"
+			if [[ "$Project_Kind" == "xcworkspace" ]]; then
+			  RAW_LIST=$(xcodebuild -list -workspace "$Project_Path" 2>/dev/null || true)
+			else
+			  RAW_LIST=$(xcodebuild -list -project   "$Project_Path" 2>/dev/null || true)
+			fi
+			
+			echo "[CFG] Step B: raw xcodebuild -list output >>>"
+			printf '%s\n' "$RAW_LIST" | sed -e 's/^/  | /'
+			echo "[CFG] <<< raw output end"
+			
+			# 只抽取 “Build Configurations:” 段落，忽略前导空格，并去掉 \r
+			CFGS=$(
+			  printf '%s\n' "$RAW_LIST" \
+			  | tr -d '\r' \
+			  | awk '
+				  /^[[:space:]]*Build Configurations:/ {inlist=1; next}
+				  inlist && /^[[:space:]]*If no build configuration/ {inlist=0}
+				  inlist { sub(/^[[:space:]]+/, "", $0); print }
+				'
+			)
+			
+			echo "[CFG] Step C: parsed configs (raw lines):"
+			printf '%s\n' "$CFGS" | sed -e 's/^/  - /'
+			
+			# 形成候选数组
+			CFG_CAND=()
+			while IFS= read -r c; do
+			  c="$(echo "$c" | xargs)"
+			  [[ -n "$c" ]] && CFG_CAND+=("$c")
+			done < <(printf '%s\n' "$CFGS")
+			
+			echo "[CFG] Step D: candidate array:"
+			if [[ ${#CFG_CAND[@]} -gt 0 ]]; then
+			  printf '  - %s\n' "${CFG_CAND[@]}"
+			else
+			  echo "  - <none>"
+			fi
+			
+			# 如果确实没解析到，给出 fallback（有些版本输出可能缺段落或被本地化）
+			if [[ ${#CFG_CAND[@]} -eq 0 ]]; then
+			  echo "[CFG][WARN] 未从输出中解析到 Build Configurations，尝试使用默认 Debug"
+			  CFG_CAND=("Debug")
+			fi
+			
+			# 选择：优先 Debug，否则取第一个
+			auto_cfg="${CFG_CAND[0]}"
+			for c in "${CFG_CAND[@]}"; do
+			  if [[ "$c" == "Debug" ]]; then auto_cfg="$c"; break; fi
+			done
+			
+			: "${Configuration:=$auto_cfg}"
+			echo "[CFG] Step E: chosen Configuration=$Configuration"
+			
+			# 4) 供后续使用的源参数（workspace / project）
+			if [[ "$Project_Kind" == "xcworkspace" ]]; then
+			  project_workspace="$Project_Path"
+			  SRC_OPTS=(-workspace "$project_workspace")
+			else
+			  project_proj="$Project_Path"
+			  SRC_OPTS=(-project "$project_proj")
+			fi
+			
+			# 落盘，给后续 step 复用（可选）
+			{
+			  echo "Project_Path=$Project_Path"
+			  echo "Project_Kind=$Project_Kind"
+			  echo "Project_Name=$Project_Name"
+			  echo "project_scheme=$project_scheme"
+			  echo "Configuration=$Configuration"
+			  if [[ "$Project_Kind" == "xcworkspace" ]]; then
+				echo "project_workspace=$project_workspace"
+			  else
+				echo "project_proj=$project_proj"
+			  fi
+			} > .xproj.auto
 		
 		
 		# —— 这些变量若未定义，这里统一给兜底，避免 set -u 触发 ——
