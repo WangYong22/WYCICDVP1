@@ -42,94 +42,94 @@ set -xeuo pipefail
 NODE='${NODE}'
 JURL='${JURL}'
 
-	# 取 CSRF crumb
-	if command -v jq >/dev/null 2>&1; then
-	  CRUMB=\$(curl -fsS -u "\$JAUTH" "\$JURL/crumbIssuer/api/json" | jq -r .crumb)
-	else
-	  CRUMB=\$(curl -fsS -u "\$JAUTH" "\$JURL/crumbIssuer/api/json" | sed -n 's/.*"crumb"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
-	fi
-	[ -n "\$CRUMB" ] || { echo "Failed to get CRUMB"; exit 1; }
+# 取 CSRF crumb
+if command -v jq >/dev/null 2>&1; then
+  CRUMB=\$(curl -fsS -u "\$JAUTH" "\$JURL/crumbIssuer/api/json" | jq -r .crumb)
+else
+  CRUMB=\$(curl -fsS -u "\$JAUTH" "\$JURL/crumbIssuer/api/json" | sed -n 's/.*"crumb"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
+fi
+[ -n "\$CRUMB" ] || { echo "Failed to get CRUMB"; exit 1; }
 
-	# 写到临时文件，避免 read -d '' 的坑
-	cat > .scriptText.groovy <<GROOVY
-	import jenkins.model.Jenkins
-	import hudson.model.Node
-	import hudson.slaves.DumbSlave
-	import hudson.slaves.RetentionStrategy
-	import hudson.slaves.JNLPLauncher
-	import java.util.LinkedList
+# 写到临时文件，避免 read -d '' 的坑
+cat > .scriptText.groovy <<GROOVY
+import jenkins.model.Jenkins
+import hudson.model.Node
+import hudson.slaves.DumbSlave
+import hudson.slaves.RetentionStrategy
+import hudson.slaves.JNLPLauncher
+import java.util.LinkedList
 
-	def name   = "${NODE}"            // ← 直接嵌入 bash 里的 NODE 值
-	def labels = name
-	def home   = "/Users/test/jenkins-agent"
-	
-	def j = Jenkins.get()
-	def n = j.getNode(name)
-	def launcher = new JNLPLauncher()
-	launcher.setWebSocket(true)
+def name   = "${NODE}"            // ← 直接嵌入 bash 里的 NODE 值
+def labels = name
+def home   = "/Users/test/jenkins-agent"
 
-	if (n == null) {
-	  n = new DumbSlave(name, "ephemeral macOS", home, "1",
-		Node.Mode.NORMAL, labels, launcher,
-		new RetentionStrategy.Always(), new LinkedList())
-	  j.addNode(n)
-	} else {
-	  n.setLauncher(launcher)
-	  n.setLabelString(labels)
-	  n.setNumExecutors(1)
-	  n.setMode(Node.Mode.NORMAL)
-	  j.save()
-	}
-	println "READY"
-	GROOVY
+def j = Jenkins.get()
+def n = j.getNode(name)
+def launcher = new JNLPLauncher()
+launcher.setWebSocket(true)
 
-		export NODE_NAME="\$NODE"
-	
-	# 执行 /scriptText
-	RESP=\$(curl -fsS -u "\$JAUTH" -H "Jenkins-Crumb: \$CRUMB" \\
-	  --data-urlencode script@.scriptText.groovy \\
-	  "\$JURL/scriptText")
-	echo "\$RESP" | grep -q READY || { echo "scriptText create node failed"; echo "\$RESP" | head -200; exit 1; }
-	
-	# 覆盖节点 config.xml（幂等）
-	curl -fsS -u "\$JAUTH" -H "Jenkins-Crumb: \$CRUMB" \\
-		 -X POST -H 'Content-Type: application/xml' \\
-		 --data-binary @node.xml \\
-		 "\$JURL/computer/\$NODE/config.xml"
+if (n == null) {
+  n = new DumbSlave(name, "ephemeral macOS", home, "1",
+    Node.Mode.NORMAL, labels, launcher,
+    new RetentionStrategy.Always(), new LinkedList())
+  j.addNode(n)
+} else {
+  n.setLauncher(launcher)
+  n.setLabelString(labels)
+  n.setNumExecutors(1)
+  n.setMode(Node.Mode.NORMAL)
+  j.save()
+}
+println "READY"
+GROOVY
 
-		# 解析 JNLP secret（新旧路径兼容）
-		sleep 2
-		HTTP1=\$(curl -u "\$JAUTH" -w '%{http_code}' -fsSLo .jnlp1 "\$JURL/computer/\$NODE/jenkins-agent.jnlp" || true)
-		HTTP2=\$(curl -u "\$JAUTH" -w '%{http_code}' -fsSLo .jnlp2 "\$JURL/computer/\$NODE/slave-agent.jnlp"   || true)
-		echo "jenkins-agent.jnlp http=\$HTTP1, slave-agent.jnlp http=\$HTTP2"
-		
-		SECRET=""
-		SECRET=\$(grep -hoE -- '--secret [0-9a-f]{64,}' .jnlp1 .jnlp2 2>/dev/null | head -1 | awk '{print \$2}') || true
-		if [ -z "\$SECRET" ]; then
-		  SECRET=\$(grep -hoE -- '<argument>[0-9a-f]{64,}</argument>' .jnlp1 .jnlp2 2>/dev/null | head -1 | sed -E 's#</?argument>##g') || true
-		fi
-		[ -n "\$SECRET" ] || { echo "no JNLP secret parsed"; head -50 .jnlp1 .jnlp2 2>/dev/null || true; exit 1; }
-		echo "\$SECRET" > .jnlp.secret
-		echo "Parsed JNLP secret length=\${#SECRET}"
-		"""
+export NODE_NAME="\$NODE"
 
-		// 关键：从文件读回到 Groovy 变量
-		def SECRET = readFile('.jnlp.secret').trim()
-		echo "Groovy got SECRET length=${SECRET.length()}"
-		
-		
-		// 3) 现在进入 withKubeConfig，下发 K8s Secret 时，使用 Groovy 变量插值
-		withKubeConfig([credentialsId: env.KCFG_ID]) {
-		  sh """#!/bin/bash
-		set -xeuo pipefail
-		kubectl -n ci delete secret jenkins-macos-${NODE} --ignore-not-found || true
-		kubectl -n ci create secret generic jenkins-macos-${NODE} \\
-		  --from-literal=JENKINS_URL=${JURL} \
-		  --from-literal=JENKINS_NODE_NAME=${NODE} \
-		  --from-literal=JENKINS_SECRET=${SECRET}  \
-		  --from-literal=VM_USER=test \
-		  --from-literal=VM_PASS=test 
-		"""
+# 执行 /scriptText
+RESP=\$(curl -fsS -u "\$JAUTH" -H "Jenkins-Crumb: \$CRUMB" \\
+  --data-urlencode script@.scriptText.groovy \\
+  "\$JURL/scriptText")
+echo "\$RESP" | grep -q READY || { echo "scriptText create node failed"; echo "\$RESP" | head -200; exit 1; }
+
+# 覆盖节点 config.xml（幂等）
+curl -fsS -u "\$JAUTH" -H "Jenkins-Crumb: \$CRUMB" \\
+     -X POST -H 'Content-Type: application/xml' \\
+     --data-binary @node.xml \\
+     "\$JURL/computer/\$NODE/config.xml"
+
+# 解析 JNLP secret（新旧路径兼容）
+sleep 2
+HTTP1=\$(curl -u "\$JAUTH" -w '%{http_code}' -fsSLo .jnlp1 "\$JURL/computer/\$NODE/jenkins-agent.jnlp" || true)
+HTTP2=\$(curl -u "\$JAUTH" -w '%{http_code}' -fsSLo .jnlp2 "\$JURL/computer/\$NODE/slave-agent.jnlp"   || true)
+echo "jenkins-agent.jnlp http=\$HTTP1, slave-agent.jnlp http=\$HTTP2"
+
+SECRET=""
+SECRET=\$(grep -hoE -- '--secret [0-9a-f]{64,}' .jnlp1 .jnlp2 2>/dev/null | head -1 | awk '{print \$2}') || true
+if [ -z "\$SECRET" ]; then
+  SECRET=\$(grep -hoE -- '<argument>[0-9a-f]{64,}</argument>' .jnlp1 .jnlp2 2>/dev/null | head -1 | sed -E 's#</?argument>##g') || true
+fi
+[ -n "\$SECRET" ] || { echo "no JNLP secret parsed"; head -50 .jnlp1 .jnlp2 2>/dev/null || true; exit 1; }
+echo "\$SECRET" > .jnlp.secret
+echo "Parsed JNLP secret length=\${#SECRET}"
+"""
+
+// 关键：从文件读回到 Groovy 变量
+def SECRET = readFile('.jnlp.secret').trim()
+echo "Groovy got SECRET length=${SECRET.length()}"
+
+
+// 3) 现在进入 withKubeConfig，下发 K8s Secret 时，使用 Groovy 变量插值
+withKubeConfig([credentialsId: env.KCFG_ID]) {
+  sh """#!/bin/bash
+set -xeuo pipefail
+kubectl -n ci delete secret jenkins-macos-${NODE} --ignore-not-found || true
+kubectl -n ci create secret generic jenkins-macos-${NODE} \\
+  --from-literal=JENKINS_URL=${JURL} \
+  --from-literal=JENKINS_NODE_NAME=${NODE} \
+  --from-literal=JENKINS_SECRET=${SECRET}  \
+  --from-literal=VM_USER=test \
+  --from-literal=VM_PASS=test 
+"""
             }
           }
         }
