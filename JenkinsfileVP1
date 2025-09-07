@@ -50,6 +50,7 @@ pipeline {
 		fi
 		[ -n "\$CRUMB" ] || { echo "Failed to get CRUMB"; exit 1; }
 
+echo "check1"
 		# 写到临时文件，避免 read -d '' 的坑
 		cat > .scriptText.groovy <<GROOVY
 		import jenkins.model.Jenkins
@@ -58,7 +59,7 @@ pipeline {
 		import hudson.slaves.RetentionStrategy
 		import hudson.slaves.JNLPLauncher
 		import java.util.LinkedList
-
+ echo "check2"
 		def name   = "${NODE}"            // ← 直接嵌入 bash 里的 NODE 值
 		def labels = name
 		def home   = "/Users/test/jenkins-agent"
@@ -67,7 +68,7 @@ pipeline {
 		def n = j.getNode(name)
 		def launcher = new JNLPLauncher()
 		launcher.setWebSocket(true)
-
+ echo "check3"
 		if (n == null) {
 		  n = new DumbSlave(name, "ephemeral macOS", home, "1",
 			Node.Mode.NORMAL, labels, launcher,
@@ -84,7 +85,7 @@ pipeline {
 		GROOVY
 
 		export NODE_NAME="\$NODE"
-		
+ echo "check4"		
 		# 执行 /scriptText
 		RESP=\$(curl -fsS -u "\$JAUTH" -H "Jenkins-Crumb: \$CRUMB" \\
 		  --data-urlencode script@.scriptText.groovy \\
