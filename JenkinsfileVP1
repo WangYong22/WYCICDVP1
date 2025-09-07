@@ -380,7 +380,7 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 			  }
 			}'
 		)
-		
+		echo "[CERT] $CODE_SIGN_IDENTITY"
 		if [ -z "${CODE_SIGN_IDENTITY:-}" ]; then
 		  echo "[ERR] 找不到匹配证书（$CERT_KIND, Team=$TEAMID）。"
 		  security find-identity -v -p codesigning || true
