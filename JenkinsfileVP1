@@ -371,13 +371,21 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		
 		# 选择匹配证书（需要你已导入带私钥证书并解锁 login 钥匙串）
 		echo "[CHK] E: pick signing identity"
-		CODE_SIGN_IDENTITY=$(security find-identity -v -p codesigning \
-		  | awk -v kind="$CERT_KIND" -v team="$TEAMID" -F\" '$0 ~ kind && $0 ~ "\\(" team "\\)" {print $2; exit}')
+
+		CODE_SIGN_IDENTITY=$(
+		  security find-identity -v -p codesigning \
+			| grep -F "$CERT_KIND" \
+			| grep -F "($TEAMID)" \
+			| sed -n 's/.*"\(.*\)".*/\1/p' \
+			| head -1
+		)
+		
 		if [ -z "${CODE_SIGN_IDENTITY:-}" ]; then
 		  echo "[ERR] 找不到匹配证书（$CERT_KIND, Team=$TEAMID）。"
 		  security find-identity -v -p codesigning || true
 		  exit 1
 		fi
+		
 		echo "[CERT] $CODE_SIGN_IDENTITY"
 		
 		# 导出环境变量供后续 xcodebuild
