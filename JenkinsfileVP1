@@ -240,7 +240,7 @@ pipeline {
 	
 		// 2) 拉取 provisioning profile（用 Jenkins 中 ID=137ssh 的私钥）
 		
-		#!/bin/bash
+		sh '''#!/bin/bash
 		set -euo pipefail
 			# 在当前工作区自动找 .xcworkspace 或 .xcodeproj
 				if [ -f *.xcworkspace ]; then
