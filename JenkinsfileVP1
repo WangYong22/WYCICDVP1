@@ -407,7 +407,7 @@ pipeline {
 			  CERT_KIND="Apple Distribution"
 			fi
 			
-			if echo "$PLATFORM0" | grep -qi 'xros\|visionOS'; then
+			if echo "$PLATFORM0" | grep -Eqi 'xros|visionOS'; then
 			  DESTINATION="generic/platform=visionOS"
 			else
 			  DESTINATION="generic/platform=iOS"
