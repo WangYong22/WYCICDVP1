@@ -589,6 +589,40 @@ PL
 		  SRC_OPTS=(-project "$project_proj")
 		fi
 		
+		# 仅当外面没手动设过 DESTINATION 时才自动探测
+		if [ -z "${DESTINATION:-}" ]; then
+		  echo "[AUTO] probing destinations for scheme: $project_scheme"
+		  RAW_DEST=$(xcodebuild "${SRC_OPTS[@]}" -scheme "$project_scheme" -showdestinations 2>/dev/null || true)
+		
+		  echo "[AUTO] -showdestinations >>>"
+		  printf '%s\n' "$RAW_DEST" | sed -e 's/^/  | /'
+		  echo "[AUTO] <<< end"
+		
+		  # 从 -showdestinations 输出里抽取 platform，并按优先级选择
+		  DESTINATION=$(
+			printf '%s\n' "$RAW_DEST" | tr -d '\r' \
+			| awk -F'[{},]' '
+				tolower($0) ~ /platform:/ {
+				  for (i=1; i<=NF; i++) {
+					if ($i ~ /platform:/) {
+					  p=$i; gsub(/^[[:space:]]*platform:[[:space:]]*/, "", p);
+					  print tolower(p)
+					}
+				  }
+				}' \
+			| awk '
+				/visionos/ { print "generic/platform=visionOS"; exit }
+				/^ios$/    { print "generic/platform=iOS";     exit }
+				/^macos$/  { print "generic/platform=macOS";   exit }'
+		  )
+		
+		  # 兜底：万一没解析到，就用 iOS（你也可以改成 macOS/visionOS）
+		  : "${DESTINATION:=generic/platform=iOS}"
+		fi
+		
+		echo "[AUTO] using destination: $DESTINATION"
+		
+		
 		# —— 构建 —— 
 		echo " 构建 Archive "
 		xcodebuild \
