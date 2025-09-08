@@ -552,6 +552,7 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		
 		
 		# —— 这些变量若未定义，这里统一给兜底，避免 set -u 触发 ——
+		echo "[INFO] WORKSPACE=$WORKSPACE"
 		
 		build_dir="${build_dir:-"${WORKSPACE:-$PWD}/build"}"
 		export_path="${export_path:-"$HOME/project/build/${Project_Name}"}"
@@ -575,10 +576,10 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		  <key>stripSwiftSymbols</key><true/>
 		  <key>compileBitcode</key><true/>
 		</dict></plist>
-		PL
+PL
 		
 		# —— 选择 workspace / project 源参数 —— 
-		echo "[INFO] Project_Path=$Project_Path"
+		
 		SRC_OPTS=()
 		if [[ "$Project_Kind" == "xcworkspace" ]]; then
 		  project_workspace="$Project_Path"
