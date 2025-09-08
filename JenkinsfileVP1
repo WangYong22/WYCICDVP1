@@ -656,7 +656,7 @@ PL
 
 		
 		# —— 构建 —— 
-		echo " 构建 Archive "
+		echo " 构建 Archive "不签名
 		xcodebuild \
 		  "${SRC_OPTS[@]}" \
 		  -scheme "$project_scheme" \
@@ -665,9 +665,10 @@ PL
 		  -archivePath "$archive_path" \
 		  -destination "$DESTINATION" \
 		  DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
-		  CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
-		  PRODUCT_BUNDLE_IDENTIFIER="$BUNDLEID" \
-		  PROVISIONING_PROFILE_SPECIFIER="$CPROVISIONING_PROFILE_NAME" \
+		  CODE_SIGNING_ALLOWED=NO \
+		 # CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
+		 # PRODUCT_BUNDLE_IDENTIFIER="$BUNDLEID" \
+		 # PROVISIONING_PROFILE_SPECIFIER="$CPROVISIONING_PROFILE_NAME" \
 		  -allowProvisioningUpdates \
 		  -allowProvisioningDeviceRegistration \
 		  -UseModernBuildSystem=NO \
