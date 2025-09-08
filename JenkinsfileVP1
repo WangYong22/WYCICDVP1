@@ -356,12 +356,16 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		  PROFILE_KIND="distribution"
 		  CERT_KIND="Apple Distribution"
 		fi
-		if echo "$PLATFORM0" | grep -Eqi 'xros|visionOS'; then
-		  DESTINATION="generic/platform=visionOS"
-		else
-		  DESTINATION="generic/platform=iOS"
-		fi
-		echo "[PP] kind=$PROFILE_KIND  dest=$DESTINATION  cert=$CERT_KIND"
+		
+		# —— 不再在这里直接设置 DESTINATION；只做平台“提示” —— 
+		case "$(printf '%s' "${PLATFORM0:-}" | tr '[:upper:]' '[:lower:]')" in
+		  visionos|xros) DESTINATION_HINT="generic/platform=visionOS" ;;
+		  ios)           DESTINATION_HINT="generic/platform=iOS" ;;
+		  macos)         DESTINATION_HINT="generic/platform=macOS" ;;
+		  *)             DESTINATION_HINT="" ;;
+		esac
+		
+		echo "[PP] kind=$PROFILE_KIND  platform_hint=${DESTINATION_HINT:-none}  cert=$CERT_KIND"
 		
 		# 安装 profile
 		DEST_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
@@ -549,6 +553,57 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		: "${Configuration:=$auto_cfg}"
 		echo "[INFO] Configuration=$Configuration"
 		
+		#自动探测 DESTINATION
+			echo "[AUTO] probing destinations for scheme: $project_scheme"
+			RAW_DEST=$(xcodebuild "${SRC_OPTS[@]}" -scheme "$project_scheme" -showdestinations 2>/dev/null || true)
+			
+			echo "[AUTO] raw -showdestinations >>>"
+			printf '%s\n' "$RAW_DEST" | sed -e 's/^/  | /'
+			echo "[AUTO] <<< end"
+			
+			DESTINATION=""
+			
+			# 1) 先找“泛化真机”目的地（generic），按优先级 visionOS -> iOS -> macOS
+			if printf '%s\n' "$RAW_DEST" | grep -Eq 'platform:[[:space:]]*visionOS([,} ]|$)'; then
+			  DESTINATION="generic/platform=visionOS"
+			elif printf '%s\n' "$RAW_DEST" | grep -Eq 'platform:[[:space:]]*iOS([,} ]|$)'; then
+			  DESTINATION="generic/platform=iOS"
+			elif printf '%s\n' "$RAW_DEST" | grep -Eq 'platform:[[:space:]]*macOS([,} ]|$)'; then
+			  DESTINATION="generic/platform=macOS"
+			fi
+			
+			# 2) 如果没有 generic，就挑一个带 id 的具体目的地（优先 visionOS 模拟器）
+			if [ -z "$DESTINATION" ]; then
+			  sim_id=$(printf '%s\n' "$RAW_DEST" \
+						 | awk -F'[{},]' '/platform:[[:space:]]*visionOS Simulator/{
+							  for(i=1;i<=NF;i++){
+								if($i ~ /id:/){gsub(/^[[:space:]]*id:[[:space:]]*/,"",$i); print $i; exit}
+							  }
+						   }' | head -1)
+			  if [ -n "$sim_id" ]; then
+				DESTINATION="id=$sim_id"
+			  fi
+			fi
+			
+			# 3) 还没有的话，挑任意一个 id
+			if [ -z "$DESTINATION" ]; then
+			  any_id=$(printf '%s\n' "$RAW_DEST" \
+						 | awk -F'[{},]' '/id:/{
+							  for(i=1;i<=NF;i++){
+								if($i ~ /id:/){gsub(/^[[:space:]]*id:[[:space:]]*/,"",$i); print $i; exit}
+							  }
+						   }' | head -1)
+			  if [ -n "$any_id" ]; then
+				DESTINATION="id=$any_id"
+			  fi
+			fi
+			
+			# 4) 最后兜底：用 profile 的平台提示；再不行就给 visionOS 作为最终兜底
+			: "${DESTINATION:=${DESTINATION_HINT:-}}"
+			: "${DESTINATION:=generic/platform=visionOS}"
+			
+			echo "[AUTO] using destination: $DESTINATION"
+		
 		
 		
 		# —— 这些变量若未定义，这里统一给兜底，避免 set -u 触发 ——
@@ -589,39 +644,7 @@ PL
 		  SRC_OPTS=(-project "$project_proj")
 		fi
 		
-		# 仅当外面没手动设过 DESTINATION 时才自动探测
-		if [ -z "${DESTINATION:-}" ]; then
-		  echo "[AUTO] probing destinations for scheme: $project_scheme"
-		  RAW_DEST=$(xcodebuild "${SRC_OPTS[@]}" -scheme "$project_scheme" -showdestinations 2>/dev/null || true)
-		
-		  echo "[AUTO] -showdestinations >>>"
-		  printf '%s\n' "$RAW_DEST" | sed -e 's/^/  | /'
-		  echo "[AUTO] <<< end"
-		
-		  # 从 -showdestinations 输出里抽取 platform，并按优先级选择
-		  DESTINATION=$(
-			printf '%s\n' "$RAW_DEST" | tr -d '\r' \
-			| awk -F'[{},]' '
-				tolower($0) ~ /platform:/ {
-				  for (i=1; i<=NF; i++) {
-					if ($i ~ /platform:/) {
-					  p=$i; gsub(/^[[:space:]]*platform:[[:space:]]*/, "", p);
-					  print tolower(p)
-					}
-				  }
-				}' \
-			| awk '
-				/visionos/ { print "generic/platform=visionOS"; exit }
-				/^ios$/    { print "generic/platform=iOS";     exit }
-				/^macos$/  { print "generic/platform=macOS";   exit }'
-		  )
-		
-		  # 兜底：万一没解析到，就用 iOS（你也可以改成 macOS/visionOS）
-		  : "${DESTINATION:=generic/platform=iOS}"
-		fi
-		
-		echo "[AUTO] using destination: $DESTINATION"
-		
+
 		
 		# —— 构建 —— 
 		echo " 构建 Archive "
