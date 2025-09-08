@@ -554,6 +554,15 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		echo "[INFO] Configuration=$Configuration"
 		
 		#自动探测 DESTINATION
+			declare -a SRC_OPTS=()
+			if [[ "$Project_Kind" == "xcworkspace" ]]; then
+			  project_workspace="$Project_Path"
+			  SRC_OPTS=(-workspace "$project_workspace")
+			else
+			  project_proj="$Project_Path"
+			  SRC_OPTS=(-project "$project_proj")
+			fi
+		
 			echo "[AUTO] probing destinations for scheme: $project_scheme"
 			RAW_DEST=$(xcodebuild "${SRC_OPTS[@]}" -scheme "$project_scheme" -showdestinations 2>/dev/null || true)
 			
