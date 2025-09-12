@@ -701,24 +701,88 @@ PL
                                    keyFileVariable: 'SSH_KEY',
                                    usernameVariable: 'SSH_USER')]) {
 		sh '''#!/bin/bash
-		set -euo pipefail
+		# 更强的调试与兜底
+		set -eE -o pipefail
+		trap 'echo "[ERROR] line=$LINENO exit=$?"' ERR
+		
+		echo "========== [DEBUG] 环境与目录 =========="
+		echo "[DEBUG] whoami=$(whoami)"
+		echo "[DEBUG] PWD=$(pwd)"
+		echo "[DEBUG] WORKSPACE=${WORKSPACE:-<unset>}"
+		echo "[DEBUG] JOB_BASE_NAME=${JOB_BASE_NAME:-<unset>} BUILD_NUMBER=${BUILD_NUMBER:-<unset>}"
+		echo "[DEBUG] 列表当前目录："
+		ls -lah || true
+		echo
 		
 		REMOTE="17.87.2.137"
 		REMOTE_BASE="/Users/mdsadmin/Documents"
 		RUN_DIR="${JOB_BASE_NAME}#${BUILD_NUMBER}"
 		REMOTE_DIR="${REMOTE_BASE}/${RUN_DIR}"
 		
-		echo "读取构建阶段写下的变量；做兜底，避免 set -u 触发"		
-		[ -f BuildVariable ] && source BuildVariable || true
+		echo "========== [DEBUG] 尝试读取 BuildVariable =========="
+		# 先关闭 -u，避免 source 时因为未定义变量而报错
+		set +u
+		if [ -f BuildVariable ]; then
+		  echo "[DEBUG] BuildVariable 存在，内容如下："
+		  sed -n '1,200p' BuildVariable || true
+		  # shellcheck disable=SC1091
+		  . BuildVariable
+		else
+		  echo "[WARN] BuildVariable 不存在：$PWD/BuildVariable"
+		fi
+		set -u
+		echo
+		
+		# 兜底并打印变量
 		export_path=${export_path:-}
 		archive_path=${archive_path:-}
 		project_scheme=${project_scheme:-app}
 		
+		echo "========== [DEBUG] 关键变量值 =========="
+		echo "[DEBUG] export_path=${export_path}"
+		echo "[DEBUG] archive_path=${archive_path}"
+		echo "[DEBUG] project_scheme=${project_scheme}"
+		echo
+		
+		echo "========== [DEBUG] 本地产物路径检查 =========="
+		if [ -n "$export_path" ]; then
+		  echo "[DEBUG] 列表 export_path：$export_path"
+		  ls -lah "$export_path" || true
+		  echo "[DEBUG] 查找 IPA："
+		  find "$export_path" -maxdepth 1 -name '*.ipa' -type f -print -exec sh -c 'echo "[DEBUG] sha1=$(shasum -a1 "$1" | cut -d" " -f1)  size=$(stat -f%z "$1") bytes  file=$1"'; echo' _ {} \; || true
+		else
+		  echo "[WARN] export_path 为空"
+		fi
+		
+		if [ -n "$archive_path" ]; then
+		  echo "[DEBUG] 检查 archive_path 目录：$archive_path"
+		  if [ -d "$archive_path" ]; then
+			du -sh "$archive_path" || true
+			echo "[DEBUG] 列表部分内容："
+			ls -lah "$archive_path" | head -50 || true
+		  else
+			echo "[WARN] archive_path 不存在目录：$archive_path"
+		  fi
+		else
+		  echo "[WARN] archive_path 为空"
+		fi
+		echo
+		
+		echo "========== [DEBUG] 远端连通性自检 =========="
+		ssh -i "$SSH_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+		  "$SSH_USER@$REMOTE" 'echo "[REMOTE] ok from $(hostname)"; uname -a; sw_vers 2>/dev/null || true' || {
+		  echo "[ERROR] SSH 直连失败（密钥/网络/账号）"
+		  exit 2
+		}
+		echo
+		
+		echo "========== [STEP] 创建远端目录 =========="
 		echo "[REMOTE] mkdir -p ${REMOTE_DIR}"
 		ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
-			"$SSH_USER@$REMOTE" "mkdir -p \"${REMOTE_DIR}\""
+		  "$SSH_USER@$REMOTE" "mkdir -p \"${REMOTE_DIR}\""
+		echo
 		
-		echo "传 ipa"
+		echo "========== [STEP] 传 IPA =========="
 		if [ -n "$export_path" ] && ls "$export_path"/*.ipa >/dev/null 2>&1; then
 		  echo "[UPLOAD] ipa -> ${REMOTE}:${REMOTE_DIR}"
 		  scp -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
@@ -727,8 +791,9 @@ PL
 		else
 		  echo "[UPLOAD] no ipa found under ${export_path}"
 		fi
+		echo
 		
-		echo " .xcarchive（用 rsync 更快且可断点续传） "
+		echo "========== [STEP] 传 .xcarchive（rsync） =========="
 		if [ -n "$archive_path" ] && [ -d "$archive_path" ]; then
 		  echo "[UPLOAD] xcarchive -> ${REMOTE}:${REMOTE_DIR}/${project_scheme}.xcarchive/"
 		  rsync -a \
@@ -738,10 +803,16 @@ PL
 		else
 		  echo "[UPLOAD] no xcarchive dir at ${archive_path}"
 		fi
+		echo
 		
-		echo "附带上传变量文件，便于远端排查"
-		[ -f BuildVariable ] && scp -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+		echo "========== [STEP] 附带上传 BuildVariable =========="
+		if [ -f BuildVariable ]; then
+		  scp -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
 			BuildVariable "$SSH_USER@$REMOTE:${REMOTE_DIR}/" || true
+		else
+		  echo "[INFO] BuildVariable 不存在，跳过上传"
+		fi
+		echo
 		
 		echo "[DONE] artifacts uploaded to ${REMOTE}:${REMOTE_DIR}"
 		'''
@@ -755,11 +826,24 @@ PL
   
   
   post {
-    always {   
-    	 withKubeConfig([credentialsId: env.KCFG_ID]) {
-    	   sh "kubectl -n ci delete pod macos-build-${BUILD_NODE} --ignore-not-found"
-       	   sh "kubectl -n ci delete secret jenkins-macos-${BUILD_NODE} --ignore-not-found"
-      }
-    }
+	always {
+	  script {
+		try {
+		  timeout(time: 2, unit: 'MINUTES') {
+			node('macmain') {                         // ← 一定要进到有 kubectl 的节点
+			  withKubeConfig([credentialsId: env.KCFG_ID]) {
+				sh """
+				  set -xe
+				  kubectl -n ci delete pod macos-build-${env.BUILD_NODE} --ignore-not-found
+				  kubectl -n ci delete secret jenkins-macos-${env.BUILD_NODE} --ignore-not-found
+				"""
+			  }
+			}
+		  }
+		} catch (e) {
+		  echo "cleanup failed: ${e}"
+		}
+	  }
+	}
   }
 }
