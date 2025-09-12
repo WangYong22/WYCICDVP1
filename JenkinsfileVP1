@@ -749,8 +749,20 @@ PL
 		  echo "[DEBUG] 列表 export_path：$export_path"
 		  ls -lah "$export_path" || true
 		  echo "[DEBUG] 查找 IPA："
-		  find "$export_path" -maxdepth 1 -name '*.ipa' -type f -print -exec sh -c 'echo "[DEBUG] sha1=$(shasum -a1 "$1" | cut -d" " -f1)  size=$(stat -f%z "$1") bytes  file=$1"'; echo' _ {} \; || true
-		else
+		  shopt -s nullglob
+	  	  found_any=false
+		  for f in "$export_path"/*.ipa; do
+		    found_any=true
+		    # 兼容 macOS 与 Linux 的 stat
+		    size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+		    sha=$(shasum -a 1 "$f" 2>/dev/null | awk '{print $1}')
+		    echo "[DEBUG] file=$f  size=${size} bytes  sha1=${sha}"
+		  done
+		  shopt -u nullglob
+		  if [ "$found_any" = false ]; then
+		    echo "[DEBUG] 没有匹配到 *.ipa"
+		  fi
+ 		else
 		  echo "[WARN] export_path 为空"
 		fi
 		
