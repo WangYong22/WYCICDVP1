@@ -628,6 +628,18 @@ kubectl -n ci create secret generic jenkins-macos-${NODE} \\
 		exportOptionsPlist="${exportOptionsPlist:-"${build_dir}/${project_scheme}.plist"}"
 		export DEVELOPMENT_TEAM="$TEAMID"
 		
+		# —— 写回 BuildVariable，供 post 阶段读取 ----
+        cat > BuildVariable <<EOF
+project_scheme=${project_scheme}
+export_path=${export_path}
+build_dir=${build_dir}
+archive_path=${archive_path}
+exportOptionsPlist=${exportOptionsPlist}
+EOF
+
+		echo "==[DEBUG] wrote BuildVariable =="
+		sed -n '1,200p' BuildVariable || true
+		
 		
 		# —— 生成 exportOptionsPlist（用 profile 名称绑定） —— 
 		mkdir -p "${build_dir}" "${export_path}"
