@@ -891,6 +891,7 @@ G
 				  --data-urlencode script@.cleanup.groovy \
 				  "\$JURL/scriptText" | sed -n '1,80p'
 				""" 
+				}
 			}
 		  }
 		} catch (e) {
